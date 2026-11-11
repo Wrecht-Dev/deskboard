@@ -24,8 +24,8 @@ from .onboarding import OnboardingPage
 from .settings import SettingsWindow
 from .sidebar import Sidebar
 
-_SESSION_FEEDS = ("dashboard", "likes", "following")
-_KNOWN_FEEDS = ("dashboard", "likes", "blog", "tagged", "search", "following")
+_SESSION_FEEDS = ("home", "dashboard", "likes", "following")
+_KNOWN_FEEDS = ("home", "dashboard", "likes", "blog", "tagged", "search", "following")
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -315,9 +315,21 @@ class MainWindow(Adw.ApplicationWindow):
         if feed:
             source = self._parse_feed(feed)
         elif self.ctx.prefs.get("last_feed"):
-            source = self._parse_feed(str(self.ctx.prefs.get("last_feed")))
+            stored = str(self.ctx.prefs.get("last_feed"))
+            if stored == "dashboard":
+                # "dashboard" was our previous default; treat it as legacy and
+                # migrate once. A deliberate Following choice is stored as
+                # "following" from now on, so later launches honor it.
+                stored = "home"
+                try:
+                    self.ctx.prefs.set("last_feed", stored)
+                except Exception:  # noqa: BLE001
+                    pass
+            source = self._parse_feed(stored)
         if source is None:
-            source = FeedSource("dashboard")
+            # A stale/unknown last_feed (e.g. from an older release) migrates to
+            # the Home tab instead of opening nothing.
+            source = FeedSource("home", title="Home")
         if not self.ctx.demo and not self.ctx.is_signed_in:
             if source.kind in ("blog", "tagged", "search"):
                 self._show_feed(source)
@@ -335,12 +347,20 @@ class MainWindow(Adw.ApplicationWindow):
         if kind in ("blog", "tagged", "search") and not value:
             return None
         title = ""
-        if kind == "blog":
+        if kind == "home":
+            title = "Home"
+        elif kind == "following":
+            # "Following" is the dashboard tab; persist it under its own name so
+            # the legacy "dashboard" value can migrate to Home exactly once.
+            return FeedSource("dashboard", title="Following")
+        elif kind == "blog":
             title = value
         elif kind == "tagged":
             title = f"#{value}"
         elif kind == "search":
             title = f"Search: {value}"
+        elif kind == "dashboard":
+            title = "Following"
         return FeedSource(kind=kind, value=value, title=title)
 
     def _needs_onboarding(self, source) -> bool:
@@ -385,7 +405,9 @@ class MainWindow(Adw.ApplicationWindow):
     def _feed_subtitle(self, source, count: int | None = None, total: int | None = None) -> str:
         """A short, informative second line for the header."""
         kind = getattr(source, "kind", "")
-        if kind in ("dashboard", "following"):
+        if kind == "home":
+            base = "For you"
+        elif kind in ("dashboard", "following"):
             base = "Your dashboard"
         elif kind == "likes":
             base = "Posts you liked"
@@ -433,7 +455,11 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _persist_feed(self, source: FeedSource) -> None:
         try:
-            self.ctx.prefs.set("last_feed", source.key)
+            # Store Following explicitly (not the legacy "dashboard" value), so
+            # the one-time dashboard -> Home migration cannot override a user
+            # who deliberately picks Following.
+            value = "following" if source.kind == "dashboard" else source.key
+            self.ctx.prefs.set("last_feed", value)
         except Exception:  # noqa: BLE001
             pass
 
@@ -495,7 +521,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.sidebar.refresh_identity()
         except Exception:  # noqa: BLE001
             pass
-        self.open_feed(FeedSource("dashboard", title="Following"))
+        self.open_feed(FeedSource("home", title="Home"))
 
     # -- search ------------------------------------------------------------ #
     def focus_search(self) -> None:
@@ -535,7 +561,7 @@ class MainWindow(Adw.ApplicationWindow):
         elif not self.ctx.demo and not self.ctx.is_signed_in:
             self.show_onboarding()
         else:
-            self.open_feed(FeedSource("dashboard"))
+            self.open_feed(FeedSource("home", title="Home"))
 
     def _on_open_blog(self, name) -> None:
         blog = str(name or "").strip()

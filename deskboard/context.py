@@ -37,7 +37,10 @@ class AppContext:
             self.user_blog = "demo"
             self.user_blogs: list[str] = ["demo"]
         else:
-            self.client = TumblrClient(cookies=self.session.cookies)
+            self.client = TumblrClient(
+                cookies=self.session.cookies,
+                on_auth_failed=self._refresh_session_from_browser,
+            )
             self.user_name = ""
             self.user_blog = ""
             self.user_blogs = []
@@ -96,6 +99,24 @@ class AppContext:
         self.user_blog = ""
         self.user_blogs = []
         self.publish("session-changed", False)
+
+    def _refresh_session_from_browser(self) -> dict[str, str] | None:
+        """Tumblr rotates session cookies; re-read the browser store once on a 401."""
+        source = (self.session.source or "").lower()
+        if not source:
+            return None
+        result = None
+        try:
+            if "firefox" in source:
+                result = self.session.import_firefox()
+            elif any(name in source for name in ("chrom", "chrome", "brave", "vivaldi", "edge")):
+                result = self.session.import_chromium()
+        except Exception:  # noqa: BLE001 - refresh must never break a request
+            return None
+        if result and result.ok and result.count:
+            self.publish("session-refreshed", self.session.cookies)
+            return dict(self.session.cookies)
+        return None
 
     def load_user(self, on_done: Callable[[bool], None] | None = None) -> None:
         """Fetch the signed-in account in the background."""

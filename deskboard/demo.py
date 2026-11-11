@@ -76,6 +76,16 @@ class DemoClient:
     def get_dashboard(self, limit: int = 20) -> Page:
         return self._page(0)
 
+    def get_home(self, limit: int = 20) -> Page:
+        """The "For you" tab: start one page in so demo shows distinct content."""
+        return self._page(1 if len(self._pages) > 1 else 0)
+
+    def get_explore(self, limit: int = 20) -> Page:
+        return self._page(2 if len(self._pages) > 2 else 0)
+
+    def get_trending_tags(self, limit: int = 20) -> list[str]:
+        return ["art", "photography", "design", "typography", "museum"]
+
     def get_blog_posts(self, blog: str, limit: int = 20, tag: str | None = None) -> Page:
         posts = [p for page in self._pages for p in page]
         if blog:

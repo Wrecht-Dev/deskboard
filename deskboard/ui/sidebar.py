@@ -31,6 +31,9 @@ class Sidebar(Gtk.Box):
         self.on_sign_in = on_sign_in
 
         self._rows: dict[str, Gtk.ListBoxRow] = {}
+        self._tag_rows: dict[str, Gtk.ListBoxRow] = {}
+        self._tags_listbox = None
+        self._tags_scroller = None
         self._selected_key = ""
         self._syncing = False
         self._tags: list[str] = []
@@ -79,8 +82,14 @@ class Sidebar(Gtk.Box):
         """Highlight the row for ``key`` without emitting a selection."""
         self._selected_key = key or ""
         row = self._rows.get(self._selected_key)
+        tag_row = self._tag_rows.get(self._selected_key)
         self._syncing = True
         try:
+            if self._tags_listbox is not None:
+                if tag_row is not None:
+                    self._tags_listbox.select_row(tag_row)
+                else:
+                    self._tags_listbox.unselect_all()
             if row is not None:
                 self.listbox.select_row(row)
             else:
@@ -138,18 +147,17 @@ class Sidebar(Gtk.Box):
             self._rows.clear()
 
             signed_in = self._signed_in()
+            self._tag_rows.clear()
+            self._tags_listbox = None
+            self._tags_scroller = None
             if signed_in:
-                self._add_heading("Following")
-                self._add_row(FeedSource("dashboard", title="Following", icon="user-home-symbolic"))
+                # Home first: the user's "not just following" dashboard tab.
+                self._add_row(FeedSource("home", title="Home", icon="go-home-symbolic"))
+                self._add_row(
+                    FeedSource("dashboard", title="Following", icon="system-users-symbolic")
+                )
                 self._add_row(FeedSource("likes", title="Likes", icon="emote-love-symbolic"))
-
-                if self._tags:
-                    self._add_heading("Tags")
-                    for tag in self._tags:
-                        self._add_row(
-                            FeedSource("tagged", value=tag, title=f"#{tag}"),
-                            marker="#",
-                        )
+                self._add_your_tags_group()
 
                 blogs = [str(name) for name in (getattr(self.ctx, "user_blogs", None) or []) if name]
                 if blogs:
@@ -169,15 +177,23 @@ class Sidebar(Gtk.Box):
         # Re-apply the current selection (rows were recreated).
         self.select(self._selected_key)
 
-    def _add_heading(self, text: str) -> None:
+    def _add_heading(self, text: str, trailing: str = "") -> None:
         try:
             row = Gtk.ListBoxRow()
             row.set_selectable(False)
             row.set_activatable(False)
             row.set_can_focus(False)
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            box.add_css_class("sidebar-heading-box")
             label = Gtk.Label(label=text, xalign=0)
+            label.set_hexpand(True)
             label.add_css_class("sidebar-heading")
-            row.set_child(label)
+            box.append(label)
+            if trailing:
+                count = Gtk.Label(label=trailing, xalign=1)
+                count.add_css_class("sidebar-heading-count")
+                box.append(count)
+            row.set_child(box)
             self.listbox.append(row)
         except Exception:  # noqa: BLE001
             pass
@@ -313,6 +329,96 @@ class Sidebar(Gtk.Box):
         if source is None:
             return
         self._selected_key = source.key
+        try:
+            if self._tags_listbox is not None:
+                self._syncing = True
+                self._tags_listbox.unselect_all()
+                self._syncing = False
+        except Exception:  # noqa: BLE001
+            pass
+        if callable(self.on_select):
+            try:
+                self.on_select(source)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # -- "Your tags" ------------------------------------------------------- #
+    def _add_your_tags_group(self) -> None:
+        """A capped, scrollable list of every tag the account follows."""
+        if not self._tags:
+            return
+        try:
+            self._add_heading("Your tags", trailing=f"{len(self._tags)} tags")
+            inner = Gtk.ListBox()
+            inner.add_css_class("navigation-sidebar")
+            inner.add_css_class("tags-list")
+            inner.set_selection_mode(Gtk.SelectionMode.SINGLE)
+            inner.set_show_separators(False)
+            inner.set_activate_on_single_click(True)
+            inner.connect("row-selected", self._on_tag_row_selected)
+
+            for tag in self._tags:
+                row = Gtk.ListBoxRow()
+                row.set_activatable(True)
+                row.add_css_class("sidebar-row")
+                source = FeedSource("tagged", value=tag, title=f"#{tag}")
+                row.source = source  # type: ignore[attr-defined]
+                box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+                box.set_margin_start(10)
+                box.set_margin_end(10)
+                box.set_margin_top(3)
+                box.set_margin_bottom(3)
+                glyph = Gtk.Label(label="#", xalign=0.5)
+                glyph.set_size_request(16, -1)
+                glyph.add_css_class("sidebar-glyph")
+                box.append(glyph)
+                label = Gtk.Label(label=tag, xalign=0)
+                label.set_ellipsize(3)
+                label.set_hexpand(True)
+                box.append(label)
+                row.set_child(box)
+                inner.append(row)
+                self._tag_rows[source.key] = row
+
+            scroller = Gtk.ScrolledWindow()
+            scroller.add_css_class("tags-scroller")
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.set_propagate_natural_height(True)
+            scroller.set_max_content_height(220)
+            try:
+                # Overlay scrollbars are invisible until hover; a classic
+                # scrollbar makes the capped tag list discoverable.
+                scroller.set_overlay_scrolling(False)
+                scroller.set_has_frame(False)
+            except Exception:  # noqa: BLE001
+                pass
+            scroller.set_child(inner)
+
+            outer = Gtk.ListBoxRow()
+            outer.set_selectable(False)
+            outer.set_activatable(False)
+            outer.set_can_focus(False)
+            outer.set_child(scroller)
+            self.listbox.append(outer)
+            self._tags_listbox = inner
+            self._tags_scroller = scroller
+        except Exception:  # noqa: BLE001
+            self._tags_listbox = None
+            self._tags_scroller = None
+
+    def _on_tag_row_selected(self, _listbox, row) -> None:
+        if self._syncing or row is None:
+            return
+        source = getattr(row, "source", None)
+        if source is None:
+            return
+        self._selected_key = source.key
+        try:
+            self._syncing = True
+            self.listbox.unselect_all()
+            self._syncing = False
+        except Exception:  # noqa: BLE001
+            pass
         if callable(self.on_select):
             try:
                 self.on_select(source)
@@ -332,7 +438,10 @@ class Sidebar(Gtk.Box):
         def work() -> None:
             tags: list[str] = []
             try:
-                raw = client.get_followed_tags() or []
+                try:
+                    raw = client.get_followed_tags(limit=200) or []
+                except TypeError:
+                    raw = client.get_followed_tags() or []
                 for item in raw:
                     if isinstance(item, str) and item.strip():
                         tags.append(item.strip())
@@ -361,7 +470,7 @@ class Sidebar(Gtk.Box):
                     if tag and key not in seen:
                         seen.add(key)
                         cleaned.append(tag)
-                self._tags = cleaned[:24]
+                self._tags = cleaned[:200]
                 self._rebuild()
             else:
                 self._tags_pending = True

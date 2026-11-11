@@ -1,6 +1,10 @@
 """API client tests — no network access is used anywhere in this module."""
 from __future__ import annotations
 
+import io
+import urllib.error
+import urllib.request
+
 import pytest
 
 from deskboard import config
@@ -205,3 +209,181 @@ def test_client_cookie_and_url_helpers():
 
     client.set_cookies({})
     assert client.has_session is False
+
+
+# --------------------------------------------------------------------------- #
+# Home ("For you") tab
+# --------------------------------------------------------------------------- #
+
+def _home_payload() -> dict:
+    return {
+        "response": {
+            "timeline": {
+                "elements": [
+                    {"objectType": "post", "type": "blocks", "id": "101", "blogName": "one",
+                     "content": [{"type": "text", "text": "first"}]},
+                    {"objectType": "client_side_ad_waterfall", "id": "ad-1"},
+                    {"objectType": "title", "title": "For you"},
+                    {"objectType": "carousel", "id": "promo-1"},
+                    {"objectType": "post", "type": "blocks", "id": "102", "blogName": "two",
+                     "content": [{"type": "text", "text": "second"}]},
+                    {"type": "blocks", "id": "103", "blogName": "three",
+                     "content": [{"type": "text", "text": "third"}]},
+                ],
+                "links": {
+                    "next": {
+                        "href": "https://www.tumblr.com/api/v2/tabs/for_you?cursor=next-page"
+                    }
+                },
+            }
+        }
+    }
+
+
+def test_get_home_parses_wrapped_timeline_and_next_link(monkeypatch):
+    client = TumblrClient()
+    monkeypatch.setattr(client, "request", lambda *args, **kwargs: _home_payload())
+
+    page = client.get_home()
+
+    assert isinstance(page, Page)
+    assert [post.id for post in page.posts] == ["101", "102", "103"]
+    assert page.next_url == "https://www.tumblr.com/api/v2/tabs/for_you?cursor=next-page"
+    assert bool(page) is True
+
+
+def test_get_home_sends_the_expected_path_and_params(monkeypatch):
+    client = TumblrClient()
+    calls: list[tuple[str, dict]] = []
+
+    def fake_request(path, params=None, **kwargs):  # noqa: ARG001
+        calls.append((path, params or {}))
+        return _home_payload()
+
+    monkeypatch.setattr(client, "request", fake_request)
+    client.get_home(limit=7)
+
+    assert calls == [
+        ("/v2/tabs/for_you", {"notes_info": "false", "reblog_info": "true", "limit": 7})
+    ]
+
+
+def test_get_home_without_a_timeline_returns_an_empty_page(monkeypatch):
+    client = TumblrClient()
+    monkeypatch.setattr(client, "request", lambda *args, **kwargs: {"response": {}})
+
+    page = client.get_home()
+
+    assert page.posts == []
+    assert page.next_url is None
+    assert page.total is None
+    assert bool(page) is False
+
+
+# --------------------------------------------------------------------------- #
+# 401 auth-refresh retry
+# --------------------------------------------------------------------------- #
+
+def _http_error(status: int = 401, detail: bytes = b"Unauthorized") -> urllib.error.HTTPError:
+    from email.message import Message
+
+    return urllib.error.HTTPError(
+        "https://www.tumblr.com/api/v2/user/info",
+        status,
+        "Unauthorized",
+        Message(),
+        io.BytesIO(detail),
+    )
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload: bytes = b'{"response": {"ok": true}}') -> None:
+        from email.message import Message
+
+        self._payload = payload
+        self.headers = Message()
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _patch_urlopen(monkeypatch, responses: list):
+    """Drive ``urllib.request.urlopen`` from a queue of responses/exceptions."""
+    urls: list[str] = []
+    cookie_headers: list[str | None] = []
+
+    def fake_urlopen(request, timeout=None, context=None):  # noqa: ARG001
+        urls.append(request.full_url)
+        cookie_headers.append(request.get_header("Cookie"))
+        item = responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return urls, cookie_headers
+
+
+def test_auth_refresh_adopts_cookies_and_retries_once(monkeypatch):
+    refreshed: list[int] = []
+
+    def on_auth_failed():
+        refreshed.append(1)
+        return {"sid": "fresh"}
+
+    client = TumblrClient(cookies={"sid": "stale"}, on_auth_failed=on_auth_failed)
+    urls, cookie_headers = _patch_urlopen(
+        monkeypatch, [_http_error(401), _FakeHTTPResponse()]
+    )
+
+    result = client.request("/v2/user/info")
+
+    assert result == {"response": {"ok": True}}
+    assert len(refreshed) == 1
+    assert len(urls) == 2
+    assert "sid=stale" in (cookie_headers[0] or "")
+    assert "sid=fresh" in (cookie_headers[1] or "")
+    assert client.cookies == {"sid": "fresh"}
+
+
+def test_auth_refresh_retry_that_also_401s_raises_without_looping(monkeypatch):
+    refreshed: list[int] = []
+
+    def on_auth_failed():
+        refreshed.append(1)
+        return {"sid": "fresh"}
+
+    client = TumblrClient(cookies={"sid": "stale"}, on_auth_failed=on_auth_failed)
+    urls, _ = _patch_urlopen(monkeypatch, [_http_error(401), _http_error(401)])
+
+    with pytest.raises(TumblrError) as raised:
+        client.request("/v2/user/info")
+
+    assert raised.value.status == 401
+    assert len(refreshed) == 1
+    assert len(urls) == 2
+
+
+def test_auth_refresh_returning_none_surfaces_the_original_error(monkeypatch):
+    refreshed: list[int] = []
+
+    def on_auth_failed():
+        refreshed.append(1)
+        return None
+
+    client = TumblrClient(cookies={"sid": "stale"}, on_auth_failed=on_auth_failed)
+    urls, _ = _patch_urlopen(monkeypatch, [_http_error(401)])
+
+    with pytest.raises(TumblrError) as raised:
+        client.request("/v2/user/info")
+
+    assert raised.value.status == 401
+    assert "expired" in str(raised.value).lower()
+    assert len(refreshed) == 1
+    assert len(urls) == 1

@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .. import config
 from ..models import Blog, Post, get, parse_posts
@@ -70,8 +70,12 @@ class TumblrClient:
         cookies: dict[str, str] | None = None,
         token: str | None = None,
         timeout: float = 25.0,
+        on_auth_failed: "Callable[[], dict[str, str] | None] | None" = None,
     ) -> None:
         self.cookies: dict[str, str] = dict(cookies or {})
+        # Called once on a 401/403: return fresh cookies to retry with, or None.
+        self.on_auth_failed = on_auth_failed
+        self._auth_refreshed = False
         self.token = token or config.DEFAULT_API_TOKEN
         self.timeout = timeout
         self._lock = threading.Lock()
@@ -158,6 +162,16 @@ class TumblrClient:
             except Exception:  # noqa: BLE001 - best effort only
                 pass
             status = exc.code
+            if status in (401, 403) and retry_auth and self.cookies and not self._auth_refreshed:
+                self._auth_refreshed = True
+                fresh = None
+                try:
+                    fresh = self.on_auth_failed() if self.on_auth_failed else None
+                except Exception:  # noqa: BLE001 - refresh is best effort
+                    fresh = None
+                if fresh:
+                    self.cookies = dict(fresh)
+                    return self.request(path, params, method=method, body=body, retry_auth=False)
             if status in (401, 403) and retry_auth and not self.cookies:
                 # The public token rotates every few months; re-read it once.
                 if self.refresh_token():
@@ -245,6 +259,52 @@ class TumblrClient:
                 {"limit": limit, "reblog_info": "true", "wrapped-timeline": "true"},
             )
         )
+
+    def get_home(self, limit: int = config.PAGE_SIZE) -> Page:
+        """The web client's **Home** tab ("For you").
+
+        ``/v2/tabs`` advertises it as ``stuff_for_you`` with the timeline URI
+        ``/v2/tabs/for_you``.  Tumblr caps a page at a handful of posts no
+        matter what ``limit`` says, so callers should pipeline requests.
+        """
+        return self._to_page(
+            self.request(
+                "/v2/tabs/for_you",
+                {"notes_info": "false", "reblog_info": "true", "limit": limit},
+            )
+        )
+
+    def get_explore(self, limit: int = config.PAGE_SIZE) -> Page:
+        """The web client's Explore timeline (recommended posts)."""
+        return self._to_page(
+            self.request(
+                "/v2/explore/recommended",
+                {"reblog_info": "true", "limit": limit},
+            )
+        )
+
+    def get_trending_tags(self, limit: int = 20) -> list[str]:
+        data = self.request("/v2/explore/trending/tags", {"limit": limit})
+        response = data.get("response", {})
+        timeline = response.get("timeline") if isinstance(response, dict) else None
+        elements = (timeline or {}).get("elements") or []
+        tags: list[str] = []
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            name = str(element.get("tagName") or element.get("name") or "")
+            for resource in element.get("resources") or []:
+                if name:
+                    break
+                if isinstance(resource, dict) and resource.get("tag"):
+                    name = str(resource["tag"])
+            if not name:
+                href = ((element.get("links") or {}).get("destination") or {}).get("href") or ""
+                if "/tagged/" in href:
+                    name = href.split("/tagged/")[-1].split("?")[0]
+            if name and name not in tags:
+                tags.append(name)
+        return tags
 
     def get_blog_posts(self, blog: str, limit: int = config.PAGE_SIZE, tag: str | None = None) -> Page:
         params: dict[str, Any] = {"limit": limit, "reblog_info": "true"}

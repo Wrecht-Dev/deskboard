@@ -51,6 +51,11 @@ indented chat ordered-list-item unordered-list-item`), `image`, `video`,
 `audio`, `link`, `poll`, `answer`. Text blocks carry `formatting` ranges
 (offset into `.text`, `type` ∈ `bold italic strikethrough link mention color`).
 
+Tumblr caps both the dashboard and the Home (`/v2/tabs/for_you`) feed at
+roughly **4 posts per page** regardless of `limit`, and a page costs
+0.6–1.2 s. Any feed UI must therefore pipeline requests ~2 pages ahead of the
+viewport instead of fetching on reach-bottom.
+
 **A reblog post often has `content == []` and everything lives in `trail`.**
 Render order is: trail (oldest first, collapsed from the root when long), then
 the post's own `content` under the reblogger's header.
@@ -58,6 +63,7 @@ the post's own `content` under the reblogger's header.
 ## API (`deskboard/api/client.py`, written)
 
 ```python
+client.get_home(limit=20) -> Page            # web "Home"/"For you" tab
 client.get_dashboard(limit=20) -> Page
 client.get_blog_posts(blog, limit=20, tag=None) -> Page
 client.get_likes(limit=20) -> Page
@@ -76,7 +82,7 @@ Page: .posts[list[Post]] .next_url[str|None] .total[int|None]
 
 ```python
 FeedSource(kind, value="", title="", subtitle="", icon="...")
-  .kind: "dashboard" | "likes" | "blog" | "tagged" | "search"
+  .kind: "home" | "dashboard" | "likes" | "blog" | "tagged" | "search"
   .label .key .requires_session()
   .load(client, cursor=None) -> Page
 ```

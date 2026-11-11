@@ -11,11 +11,20 @@
   background-color: @sidebar_bg_color;
 }
 
+.sidebar-heading-box {
+  margin: 16px 12px 4px 12px;
+}
+
 .sidebar-heading {
   font-size: 0.78em;
   font-weight: 800;
-  margin: 16px 12px 4px 12px;
   opacity: 0.55;
+}
+
+.sidebar-heading-count {
+  font-size: 0.78em;
+  font-weight: 600;
+  opacity: 0.4;
 }
 
 .sidebar-row {
@@ -38,6 +47,14 @@
 
 .account-footer {
   border-top: 1px solid alpha(@window_fg_color, 0.10);
+}
+
+.tags-scroller {
+  margin: 2px 8px 6px 8px;
+}
+
+.tags-scroller .tags-list {
+  background: transparent;
 }
 
 /* --------------------------------------------------------------- feed cards */

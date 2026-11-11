@@ -43,28 +43,45 @@ class ImageCache:
         self,
         directory: Path,
         mem_items: int = 320,
+        mem_bytes: int = 96 * 1024 * 1024,
         disk_bytes: int = 768 * 1024 * 1024,
         workers: int = 6,
     ) -> None:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.mem_items = mem_items
+        # Decoded textures are large (a 1280x1920 photo is ~9.4 MB of RGBA), so
+        # the cache is budgeted in bytes, not items, and evicts LRU.
+        self.mem_bytes = mem_bytes
+        self._mem_bytes = 0
+        self._sizes: dict[str, int] = {}
         self.disk_bytes = disk_bytes
         self._memory: OrderedDict[str, object] = OrderedDict()
         self._inflight: dict[str, list[Callback]] = {}
         self._lock = threading.Lock()
         self._workers = workers
-        self._queue: list[tuple[str, int, int, Callback]] = []
+        # Normal-priority loads (something the user is looking at) are served
+        # before look-ahead prefetches, so prefetching can never make the
+        # visible feed slower.
+        self._queue_hi: list[tuple[str, int, int, Callback]] = []
+        self._queue_lo: list[tuple[str, int, int, Callback]] = []
         self._queue_cv = threading.Condition()
         self._threads: list[threading.Thread] = []
         self._running = True
         self._ssl = None
+        # cheap counters, surfaced by DESKBOARD_DEBUG=1 at shutdown
+        self.stats = {"requests": 0, "disk_hits": 0, "network": 0, "decoded": 0, "failed": 0}
         self._start_threads()
         threading.Thread(target=self._trim_disk, daemon=True, name="img-trim").start()
 
     # -- public API -------------------------------------------------------- #
-    def load(self, url: str, width: int, height: int, callback: Callback) -> None:
-        """Load ``url`` scaled to fit ``width``x``height``; callback gets a texture."""
+    def load(self, url: str, width: int, height: int, callback: Callback, prefetch: bool = False) -> None:
+        """Load ``url`` scaled to fit ``width``x``height``; callback gets a texture.
+
+        ``prefetch=True`` queues the work behind every normal load, so a screen
+        full of images still loads before speculative work.
+        """
+        self.stats["requests"] += 1
         if not url:
             self._deliver(callback, None)
             return
@@ -82,13 +99,20 @@ class ImageCache:
                 return
             self._inflight[key] = [callback]
         with self._queue_cv:
-            self._queue.append((url, width, height, callback))
+            queue = self._queue_lo if prefetch else self._queue_hi
+            queue.append((url, width, height, callback))
             self._queue_cv.notify()
 
     def prefetch(self, urls: list[str], width: int = 500, height: int = 750) -> None:
         for url in urls:
             if url:
-                self.load(url, width, height, lambda _texture: None)
+                self.load(url, width, height, lambda _texture: None, prefetch=True)
+
+    @property
+    def memory_usage(self) -> tuple[int, int]:
+        """(textures held, approximate bytes held) — for diagnostics."""
+        with self._lock:
+            return len(self._memory), self._mem_bytes
 
     def cached(self, url: str, width: int) -> object | None:
         with self._lock:
@@ -119,11 +143,12 @@ class ImageCache:
     def _worker(self) -> None:
         while True:
             with self._queue_cv:
-                while self._running and not self._queue:
+                while self._running and not self._queue_hi and not self._queue_lo:
                     self._queue_cv.wait(0.5)
                 if not self._running:
                     return
-                url, width, height, _callback = self._queue.pop(0)
+                queue = self._queue_hi if self._queue_hi else self._queue_lo
+                url, width, height, _callback = queue.pop(0)
             texture = None
             try:
                 texture = self._fetch_and_decode(url, width, height)
@@ -133,12 +158,25 @@ class ImageCache:
             with self._lock:
                 callbacks = self._inflight.pop(key, [])
                 if texture is not None:
-                    self._memory[key] = texture
-                    self._memory.move_to_end(key)
-                    while len(self._memory) > self.mem_items:
-                        self._memory.popitem(last=False)
+                    self._store_texture(key, texture)
             for callback in callbacks:
                 self._deliver(callback, texture)
+
+    def _store_texture(self, key: str, texture: object) -> None:
+        old = self._memory.pop(key, None)
+        if old is not None:
+            self._mem_bytes -= self._sizes.pop(key, 0)
+        size = _texture_bytes(texture)
+        self._memory[key] = texture
+        self._sizes[key] = size
+        self._mem_bytes += size
+        while self._memory and (
+            len(self._memory) > self.mem_items or self._mem_bytes > self.mem_bytes
+        ):
+            if len(self._memory) == 1:
+                break  # always keep the texture being displayed
+            evicted, _texture = self._memory.popitem(last=False)
+            self._mem_bytes -= self._sizes.pop(evicted, 0)
 
     def _deliver(self, callback: Callback, texture: object) -> None:
         def run() -> bool:
@@ -160,9 +198,12 @@ class ImageCache:
     def _read_bytes(self, url: str) -> bytes | None:
         path = self._disk_path(url)
         try:
-            return path.read_bytes()
+            data = path.read_bytes()
+            self.stats["disk_hits"] += 1
+            return data
         except OSError:
             pass
+        self.stats["network"] += 1
         try:
             request = urllib.request.Request(
                 url,
@@ -187,8 +228,12 @@ class ImageCache:
     def _fetch_and_decode(self, url: str, width: int, height: int):
         data = self._read_bytes(url)
         if data is None:
+            self.stats["failed"] += 1
             return None
-        return decode_bytes(data, width, height)
+        texture = decode_bytes(data, width, height)
+        if texture is not None:
+            self.stats["decoded"] += 1
+        return texture
 
     def _trim_disk(self) -> None:
         """Drop least-recently-used files once the cache exceeds its budget."""
@@ -217,6 +262,13 @@ class ImageCache:
                     break
         except OSError:
             pass
+
+
+def _texture_bytes(texture: object) -> int:
+    try:
+        return max(1, int(texture.get_width()) * int(texture.get_height()) * 4)
+    except Exception:  # noqa: BLE001 - unknown texture type
+        return 4 * 1024 * 1024
 
 
 def decode_bytes(data: bytes, width: int, height: int):

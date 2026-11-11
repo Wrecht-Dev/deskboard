@@ -258,6 +258,9 @@ def _thumbnail(ctx: Any, url: str, size: int = 64) -> Gtk.Picture:
     picture.set_can_shrink(True)
     picture.add_css_class("card")
 
+    width = height = size * 2
+    state = {"requested": False}
+
     def apply(texture: Any) -> None:
         try:
             if texture is not None:
@@ -265,10 +268,25 @@ def _thumbnail(ctx: Any, url: str, size: int = 64) -> Gtk.Picture:
         except Exception:  # noqa: BLE001 - card may have been recycled
             pass
 
-    try:
-        ctx.images.load(url, size * 2, size * 2, apply)
-    except Exception:  # noqa: BLE001 - images are optional
-        pass
+    def on_map(_widget: Gtk.Widget) -> None:
+        # Link thumbnails live inside recycled ListView rows: only fetch once
+        # the row is actually mapped, then reuse the cache on re-map.
+        try:
+            texture = ctx.images.cached(url, width)
+        except Exception:  # noqa: BLE001
+            texture = None
+        if texture is not None:
+            apply(texture)
+            return
+        if state["requested"]:
+            return
+        state["requested"] = True
+        try:
+            ctx.images.load(url, width, height, apply)
+        except Exception:  # noqa: BLE001 - images are optional
+            pass
+
+    picture.connect("map", on_map)
     return picture
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from collections import deque
 
 import gi
 
@@ -27,12 +28,19 @@ from gi.repository import Adw, Gio, GLib, GObject, Gtk
 
 from .. import config
 from ..api.client import TumblrError
+from ..api.sources import FeedSource
+from ..models import upscale_image_url
 from .postcard import PostCard
 
-# Start fetching the next page when the viewport is this close to the bottom.
+# Start consuming the buffer when the viewport is this close to the bottom.
 _SCROLL_THRESHOLD = 700
-# Never auto-fill more than a handful of pages to cover a very tall window.
-_AUTO_FILL_LIMIT = 8
+# Keep this many unread posts landed ahead of the viewport (Tumblr gives ~4/page).
+_TARGET_BUFFER_POSTS = 8
+# Never hold more than two landed pages; never run more than two requests.
+_MAX_BUFFER_PAGES = 2
+_MAX_INFLIGHT = 2
+# Never auto-fill more than this many pages to cover a very tall window.
+_AUTO_FILL_LIMIT = 12
 
 
 def _describe_error(error: BaseException) -> str:
@@ -85,11 +93,15 @@ class FeedPage(Gtk.Box):
 
         # pagination / request state
         self._generation = 0
-        self._loading = False
-        self._finished = False
-        self._cursor: str | None = None
+        self._started = False          # first page has landed
+        self._finished = False         # no next_url left
+        self._cursor: str | None = None  # cursor for the next request
+        self._inflight: set[str] = set()
+        self._seen_cursors: set[str] = set()
+        self._buffer: deque = deque()  # landed pages not appended yet
+        self._buffer_posts = 0
+        self._prefetch_error = ""
         self._added: set[str] = set()
-        self._more_error = False
         self._auto_attempts = 0
         self._fill_source_id = 0
         self._vadj_handler = 0
@@ -158,13 +170,17 @@ class FeedPage(Gtk.Box):
     def refresh(self) -> None:
         """Reset pagination and reload from the top."""
         self._generation += 1
-        self._loading = False
+        self._started = False
         self._finished = False
         self._cursor = None
         self._total = None
+        self._inflight.clear()
+        self._seen_cursors.clear()
+        self._buffer.clear()
+        self._buffer_posts = 0
+        self._prefetch_error = ""
         self._added.clear()
         self._bound.clear()
-        self._more_error = False
         self._auto_attempts = 0
         if self._fill_source_id:
             try:
@@ -175,12 +191,15 @@ class FeedPage(Gtk.Box):
         self.store.remove_all()
         self._set_footer(None)
         self._show_state("loading")
-        self._start_load(None)
+        self._request_page(None)
 
     def cleanup(self) -> None:
         """Invalidate in-flight work; called when the page is replaced."""
         self._generation += 1
-        self._loading = False
+        self._inflight.clear()
+        self._buffer.clear()
+        self._buffer_posts = 0
+        self._prefetch_error = ""
         if self._fill_source_id:
             try:
                 GLib.source_remove(self._fill_source_id)
@@ -526,21 +545,33 @@ class FeedPage(Gtk.Box):
             pass
 
     def _retry_more(self) -> None:
-        self._more_error = False
+        self._prefetch_error = ""
+        if not self._started:
+            self.refresh()
+            return
+        cursor = self._cursor
+        if cursor is None:
+            self._set_footer(None)
+            return
         self._set_footer("loading")
-        self._start_load(self._cursor)
+        if not self._request_page(cursor):
+            self._sync_footer()
 
     # -- pagination -------------------------------------------------------- #
-    def _start_load(self, cursor: str | None) -> None:
-        if self._loading:
-            return
-        if cursor is not None and (self._finished or self._more_error):
-            return
+    def _request_page(self, cursor: str | None) -> bool:
+        """Start one background page fetch (never blocks the GTK main loop)."""
+        key = cursor if isinstance(cursor, str) else ""
+        if key in self._inflight or key in self._seen_cursors:
+            return False
+        if len(self._inflight) >= _MAX_INFLIGHT:
+            return False
+        if cursor is None and self._started:
+            return False
+        if cursor is not None and self._finished:
+            return False
         generation = self._generation
-        self._loading = True
-        if cursor is not None:
-            self._set_footer("loading")
-
+        self._inflight.add(key)
+        self._seen_cursors.add(key)
         client = self.ctx.client
         source = self.source
 
@@ -550,7 +581,12 @@ class FeedPage(Gtk.Box):
             total: int | None = None
             error = ""
             try:
-                page = source.load(client, cursor)
+                # DemoClient predates the Home tab; fall back to the dashboard
+                # so --demo keeps working until demo.py grows get_home().
+                if source.kind == "home" and not hasattr(client, "get_home"):
+                    page = FeedSource("dashboard").load(client, cursor)
+                else:
+                    page = source.load(client, cursor)
                 if page is not None:
                     posts = list(getattr(page, "posts", None) or [])
                     candidate = getattr(page, "next_url", None)
@@ -565,7 +601,9 @@ class FeedPage(Gtk.Box):
             except Exception as exc:  # noqa: BLE001 - never let a worker die loudly
                 error = _describe_error(exc)
             try:
-                GLib.idle_add(self._finish_load, generation, posts, next_url, error, total)
+                GLib.idle_add(
+                    self._finish_page, generation, cursor, posts, next_url, error, total
+                )
             except Exception:  # noqa: BLE001
                 pass
 
@@ -573,68 +611,187 @@ class FeedPage(Gtk.Box):
             threading.Thread(
                 target=work, daemon=True, name=f"feed-{source.kind}-{generation}"
             ).start()
+            return True
         except Exception as exc:  # noqa: BLE001 - e.g. resource exhaustion
-            self._loading = False
-            self._show_error(_describe_error(exc))
+            self._inflight.discard(key)
+            self._seen_cursors.discard(key)
+            self._prefetch_error = _describe_error(exc)
+            if self.store.get_n_items() == 0:
+                self._show_error(self._prefetch_error)
+            else:
+                self._sync_footer()
+            return False
 
-    def _finish_load(
+    def _finish_page(
         self,
         generation: int,
+        cursor: str | None,
         posts: list,
         next_url: str | None,
         error: str,
         total: int | None = None,
     ) -> bool:
+        key = cursor if isinstance(cursor, str) else ""
         try:
             if generation != self._generation:
                 return False  # stale: the feed changed while we were fetching
-            initial = self._cursor is None
-            self._loading = False
+            self._inflight.discard(key)
             if error:
-                self._more_error = not initial and self.store.get_n_items() > 0
-                if self._more_error:
-                    self._set_footer("error")
-                    self.ctx.toast("Couldn't load more posts")
-                else:
+                self._seen_cursors.discard(key)  # allow an explicit retry
+                self._prefetch_error = error
+                if self.store.get_n_items() == 0:
                     self._show_error(error)
+                else:
+                    self._sync_footer()
                 return False
 
-            added = 0
-            for post in posts:
-                if post is None:
-                    continue
-                key = _post_key(post)
-                if key in self._added:
-                    continue
-                self._added.add(key)
-                self.store.append(PostItem(post))
-                added += 1
-
+            self._prefetch_error = ""
+            self._started = True
             if total is not None:
                 self._total = total
-            self._cursor = next_url
             self._finished = next_url is None
-            if not initial and added == 0:
-                # An empty or all-duplicates page: stop rather than loop forever.
+            self._cursor = None if self._finished else next_url
+            if next_url and next_url in self._seen_cursors:
+                # The API handed back a cursor we already requested: stop instead
+                # of looping forever.
                 self._finished = True
-            if self.store.get_n_items() == 0:
+                self._cursor = None
+
+            self._prefetch_images(posts)
+            has_new = any(
+                _post_key(post) not in self._added for post in posts if post is not None
+            )
+            first_page = self.store.get_n_items() == 0
+            if first_page:
+                self._append_page(posts, total)
+                if self.store.get_n_items() == 0:
+                    self._finished = True
+                    self._cursor = None
+                    self._show_state("empty")
+            elif posts and has_new:
+                self._buffer.append({"posts": posts, "total": total})
+                self._buffer_posts += len(posts)
+            else:
+                # Empty or all-duplicate page: stop rather than spin the API.
                 self._finished = True
-                self._show_state("empty")
-                self._set_footer(None)
-                return False
-            self._more_error = False
-            self._set_footer(None)
-            self._show_state("content")
+                self._cursor = None
+
+            if self.store.get_n_items():
+                self._show_state("content")
             self._notify_progress()
+            self._drain_buffer_if_needed()
+            self._ensure_prefetch()
+            self._sync_footer()
             self._schedule_fill_check()
             return False
         except Exception as exc:  # noqa: BLE001
             try:
-                self._loading = False
-                self._show_error(_describe_error(exc))
+                self._inflight.discard(key)
+                self._prefetch_error = _describe_error(exc)
+                if self.store.get_n_items() == 0:
+                    self._show_error(self._prefetch_error)
+                else:
+                    self._sync_footer()
             except Exception:  # noqa: BLE001
                 pass
             return False
+
+    def _append_page(self, posts: list, total: int | None = None) -> int:
+        added = 0
+        for post in posts or []:
+            if post is None:
+                continue
+            key = _post_key(post)
+            if key in self._added:
+                continue
+            self._added.add(key)
+            self.store.append(PostItem(post))
+            added += 1
+        if total is not None:
+            self._total = total
+        return added
+
+    def _drain_buffer(self) -> bool:
+        """Append every landed page immediately (no spinner, no stall)."""
+        if not self._buffer:
+            return False
+        drained = False
+        try:
+            while self._buffer:
+                page = self._buffer.popleft()
+                self._buffer_posts = max(
+                    0, self._buffer_posts - len(page.get("posts") or [])
+                )
+                self._append_page(page.get("posts") or [], page.get("total"))
+                drained = True
+            if self.store.get_n_items():
+                self._show_state("content")
+            self._notify_progress()
+        except Exception:  # noqa: BLE001
+            pass
+        self._ensure_prefetch()
+        self._sync_footer()
+        self._schedule_fill_check()
+        return drained
+
+    def _drain_buffer_if_needed(self) -> bool:
+        if not self._buffer:
+            return False
+        if self._underfilled() or self._near_bottom():
+            return self._drain_buffer()
+        return False
+
+    def _ensure_prefetch(self) -> None:
+        """Keep ~8 posts / two pages landed ahead of the viewport."""
+        try:
+            if self._finished or self._prefetch_error:
+                return
+            if len(self._inflight) >= _MAX_INFLIGHT:
+                return
+            if (
+                self._buffer_posts >= _TARGET_BUFFER_POSTS
+                or len(self._buffer) >= _MAX_BUFFER_PAGES
+            ):
+                return
+            if not self._started:
+                self._request_page(None)
+                return
+            if self._cursor is None:
+                return
+            self._request_page(self._cursor)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _prefetch_images(self, posts: list) -> None:
+        """Warm the image cache for posts that are already landed but offscreen."""
+        if not posts:
+            return
+        images: list[str] = []
+        avatars: list[str] = []
+        for post in posts[:20]:
+            if post is None:
+                continue
+            try:
+                media = getattr(post, "first_image", None)
+                if (
+                    media is not None
+                    and getattr(media, "kind", "image") == "image"
+                    and getattr(media, "url", "")
+                ):
+                    images.append(upscale_image_url(media.url, 1280))
+                avatar = str(getattr(post, "blog_avatar", "") or "")
+                if avatar:
+                    avatars.append(avatar)
+            except Exception:  # noqa: BLE001
+                continue
+        try:
+            self.ctx.images.prefetch(images, width=640)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.ctx.images.prefetch(avatars, width=64)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _notify_progress(self) -> None:
         if not callable(self.on_progress):
@@ -652,8 +809,60 @@ class FeedPage(Gtk.Box):
         except Exception:  # noqa: BLE001
             pass
 
+    # -- viewport helpers -------------------------------------------------- #
+    def _adjustment(self):
+        try:
+            return self.scroller.get_vadjustment()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _near_bottom(self) -> bool:
+        adjustment = self._adjustment()
+        if adjustment is None:
+            return False
+        try:
+            return (
+                adjustment.get_upper()
+                - (adjustment.get_value() + adjustment.get_page_size())
+                < _SCROLL_THRESHOLD
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _underfilled(self) -> bool:
+        adjustment = self._adjustment()
+        if adjustment is None:
+            return False
+        try:
+            return adjustment.get_upper() <= adjustment.get_page_size() + 6
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _sync_footer(self) -> None:
+        try:
+            if self.store.get_n_items() == 0:
+                self._set_footer(None)
+                return
+            waiting = self._near_bottom() or self._underfilled()
+            if not waiting:
+                self._set_footer(None)
+            elif self._buffer:
+                self._set_footer(None)
+            elif self._prefetch_error:
+                self._set_footer("error")
+            elif not self._finished and (self._inflight or self._cursor is not None):
+                self._set_footer("loading")
+            else:
+                self._set_footer(None)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _schedule_fill_check(self) -> None:
-        if self._fill_source_id or self._finished or self._loading:
+        if self._fill_source_id:
+            return
+        if self._finished and not self._buffer:
+            return
+        if not (self._buffer or self._inflight):
             return
         try:
             self._fill_source_id = GLib.timeout_add(140, self._check_fill)
@@ -661,46 +870,64 @@ class FeedPage(Gtk.Box):
             self._fill_source_id = 0
 
     def _check_fill(self) -> bool:
-        """Load another page when the first one does not fill the window."""
+        """Append buffered pages when the window is still not full."""
         self._fill_source_id = 0
         try:
-            if self._loading or self._finished or self._more_error:
-                return False
-            if self._auto_attempts >= _AUTO_FILL_LIMIT:
-                return False
-            adjustment = self.scroller.get_vadjustment()
-            if adjustment is None:
-                return False
-            if adjustment.get_upper() <= adjustment.get_page_size() + 6:
-                self._auto_attempts += 1
-                if self._cursor is not None:
-                    self._start_load(self._cursor)
+            if self._buffer and (self._underfilled() or self._near_bottom()):
+                if self._auto_attempts < _AUTO_FILL_LIMIT:
+                    self._auto_attempts += 1
+                    self._drain_buffer()
+            if (
+                not self._finished
+                and not self._prefetch_error
+                and not self._buffer
+                and not self._inflight
+                and self._underfilled()
+                and self._cursor is not None
+            ):
+                self._set_footer("loading")
+                self._request_page(self._cursor)
+            self._sync_footer()
+            if (
+                (self._buffer or self._inflight)
+                and not self._finished
+                and (self._underfilled() or self._near_bottom())
+            ):
+                self._schedule_fill_check()
         except Exception:  # noqa: BLE001
             pass
         return False
 
     def _on_scroll(self, adjustment) -> None:
         try:
-            if self._loading or self._finished or self._more_error:
+            if self.store.get_n_items() == 0:
                 return
-            if self._cursor is None:
+            if not self._near_bottom():
+                self._sync_footer()
                 return
-            upper = adjustment.get_upper()
-            page = adjustment.get_page_size()
-            value = adjustment.get_value()
-            if upper - (value + page) < _SCROLL_THRESHOLD:
-                self._load_more()
+            if self._buffer:
+                self._drain_buffer()
+                return
+            if self._prefetch_error:
+                self._set_footer("error")
+                return
+            if self._inflight:
+                self._set_footer("loading")
+                return
+            if not self._finished and self._cursor is not None:
+                self._set_footer("loading")
+                if not self._request_page(self._cursor):
+                    self._sync_footer()
+                return
+            self._set_footer(None)
         except Exception:  # noqa: BLE001
             pass
 
     def _load_more(self) -> None:
-        if self._loading or self._finished or self._more_error:
-            return
-        if self._cursor is None:
-            return
-        self._start_load(self._cursor)
+        adjustment = self._adjustment()
+        if adjustment is not None:
+            self._on_scroll(adjustment)
 
-    # -- misc -------------------------------------------------------------- #
     def _on_prefs_changed(self, key: str = "") -> None:
         """Recycle every visible row when a card-affecting preference changes."""
         if key not in ("show_avatars", "compact", "nsfw_blur", "autoplay_video"):

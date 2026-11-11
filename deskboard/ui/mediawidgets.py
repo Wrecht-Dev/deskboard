@@ -153,6 +153,33 @@ def _safe_pref(ctx: Any, key: str, default: bool = False) -> bool:
         return default
 
 
+def _cached_texture(ctx: Any, url: str, width: int) -> Any:
+    """Synchronous cache probe used by recycled/offscreen rows."""
+    if not url:
+        return None
+    try:
+        return ctx.images.cached(url, width)
+    except Exception:  # noqa: BLE001 - cache is optional in tests
+        return None
+
+
+def _idle_when_mapped(widget: Gtk.Widget, callback: Callable[[], None]) -> None:
+    """Run ``callback`` once, after an idle turn, only if still visible."""
+
+    def run() -> bool:
+        try:
+            if widget.get_mapped():
+                callback()
+        except Exception:  # noqa: BLE001 - widget may have been destroyed
+            pass
+        return False
+
+    try:
+        GLib.idle_add(run)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # Application-shutdown cleanup
 # --------------------------------------------------------------------------- #
@@ -374,6 +401,10 @@ class _GifContent(Gtk.Overlay):
         self._stream = None
         self._poster_failed = False
         self._transcode_done = False
+        self._poster_request_url = upscale_image_url(media.url, 640) if media.url else ""
+        self._poster_width = 640
+        self._poster_loaded = False
+        self._poster_attempted = False
         self.set_hexpand(True)
         self.set_vexpand(False)
         self.set_overflow(Gtk.Overflow.HIDDEN)
@@ -408,18 +439,27 @@ class _GifContent(Gtk.Overlay):
         self.stack.set_visible_child_name("poster")
 
         _register_media_cleanup(self._shutdown)
-        self._load_poster()
+        cached = _cached_texture(ctx, self._poster_request_url, self._poster_width)
+        if cached is not None:
+            self.poster.set_paintable(cached)
+            self._poster_loaded = True
 
     def _shutdown(self) -> None:
         self._teardown()
 
     # -- poster ------------------------------------------------------------ #
     def _load_poster(self) -> None:
-        url = self.media.url
-        if not url:
+        if self._poster_loaded or self._poster_attempted:
+            return
+        if not self._poster_request_url:
             self._poster_failed = True
             return
-        target_width = max(int(self._width_hint), 500)
+        cached = _cached_texture(self.ctx, self._poster_request_url, self._poster_width)
+        if cached is not None:
+            self._poster_loaded = True
+            self.poster.set_paintable(cached)
+            return
+        self._poster_attempted = True
 
         def apply(texture) -> None:
             if not self._alive:
@@ -429,16 +469,19 @@ class _GifContent(Gtk.Overlay):
                 if self._transcode_done and not self._path:
                     self.stack.set_visible_child_name("error")
             else:
+                self._poster_loaded = True
                 self.poster.set_paintable(texture)
 
         try:
-            self.ctx.images.load(upscale_image_url(url, 500), target_width, target_width, apply)
+            self.ctx.images.load(
+                self._poster_request_url, self._poster_width, self._poster_width, apply
+            )
         except Exception:  # noqa: BLE001
             self._poster_failed = True
 
     # -- play/teardown ----------------------------------------------------- #
     def _request_transcode(self) -> None:
-        if self._requested:
+        if self._requested or not self._alive or not self._mapped:
             return
         self._requested = True
 
@@ -506,17 +549,35 @@ class _GifContent(Gtk.Overlay):
         except Exception:  # noqa: BLE001 - keep the poster instead
             pass
 
-    # -- Gtk lifecycle ----------------------------------------------------- #
-    def do_map(self) -> None:
-        Gtk.Widget.do_map(self)
-        self._mapped = True
+    def _become_visible(self) -> None:
+        if not self._alive or not self._mapped:
+            return
+        self._load_poster()
         self._request_transcode()
         if self._path:
             self._play()
 
+    # -- Gtk lifecycle ----------------------------------------------------- #
+    def do_map(self) -> None:
+        Gtk.Widget.do_map(self)
+        self._mapped = True
+        if not self._poster_loaded and self._poster_request_url:
+            cached = _cached_texture(self.ctx, self._poster_request_url, self._poster_width)
+            if cached is not None:
+                self._poster_loaded = True
+                self.poster.set_paintable(cached)
+        _idle_when_mapped(self, self._become_visible)
+
     def do_unmap(self) -> None:
         self._mapped = False
         self._teardown()
+        try:
+            if self.poster.get_paintable() is not None:
+                self.poster.set_paintable(None)
+        except Exception:  # noqa: BLE001
+            pass
+        self._poster_loaded = False
+        self._poster_attempted = False
         Gtk.Widget.do_unmap(self)
 
     def do_unroot(self) -> None:
@@ -548,6 +609,8 @@ class _MediaTile(Gtk.Overlay):
         self._loaded = False
         self._single = single
         self._width_hint = width_hint
+        self._request_width = 1280 if single else 640
+        self._request_url = upscale_image_url(media.url, self._request_width) if media.url else ""
         self.set_hexpand(True)
         self.set_vexpand(False)
 
@@ -594,24 +657,61 @@ class _MediaTile(Gtk.Overlay):
 
         _make_clickable(self, lambda _n: on_click(index))
         if not self.is_gif:
-            self._load()
+            cached = _cached_texture(ctx, self._request_url, self._request_width)
+            if cached is not None:
+                self.picture.set_paintable(cached)
+                self._loaded = True
+
+    def do_map(self) -> None:
+        Gtk.Widget.do_map(self)
+        if self.is_gif:
+            return
+        if not self._loaded:
+            cached = _cached_texture(self.ctx, self._request_url, self._request_width)
+            if cached is not None:
+                # Scroll-back with a warm cache: no idle turn, no request.
+                self._loaded = True
+                self.picture.set_paintable(cached)
+            else:
+                # Wait one idle turn: a fast scroll past this row should not
+                # queue an image request at all.
+                _idle_when_mapped(self, self._load)
+
+    def do_unmap(self) -> None:
+        # Drop the paintable so an offscreen row does not pin a GdkTexture;
+        # do_map re-applies it synchronously from ctx.images.cached().
+        if not self.is_gif:
+            try:
+                if self.picture.get_paintable() is not None:
+                    self.picture.set_paintable(None)
+            except Exception:  # noqa: BLE001
+                pass
+            self._loaded = False
+        Gtk.Widget.do_unmap(self)
 
     # -- loading ----------------------------------------------------------- #
     def _load(self) -> None:
-        if self._loaded:
+        if self._loaded or not self._alive:
+            return
+        if not self.get_mapped():
+            return
+        cached = _cached_texture(self.ctx, self._request_url, self._request_width)
+        if cached is not None:
+            self._loaded = True
+            self.picture.set_paintable(cached)
             return
         self._loaded = True
-        url = upscale_image_url(self.media.url, 1280 if self._single else 800)
-        width = max(320, int(self._width_hint))
-        height = max(320, int(self._width_hint * 1.5))
+        width = max(320, int(self._request_width))
+        height = max(320, int(self._request_width * 1.5))
 
         def apply(texture) -> None:
             if not self._alive:
                 return
-            self._stop_spinner()
             if texture is None:
                 self.stack.set_visible_child_name("error")
                 return
+            if not self.get_mapped():
+                return  # row scrolled away while decoding; re-cache on map
             try:
                 self.picture.set_paintable(texture)
                 self.stack.set_visible_child_name("content")
@@ -619,9 +719,8 @@ class _MediaTile(Gtk.Overlay):
                 pass
 
         try:
-            self.ctx.images.load(url, width, height, apply)
+            self.ctx.images.load(self._request_url, width, height, apply)
         except Exception:  # noqa: BLE001
-            self._stop_spinner()
             self.stack.set_visible_child_name("error")
 
     def _stop_spinner(self) -> None:
@@ -714,7 +813,7 @@ class ImageGrid(Gtk.Widget):
                 self.medias[index],
                 ctx,
                 index if not (count > 4 and index == 3) else 4,
-                1280 if count == 1 else 800,
+                1280 if count == 1 else 640,
                 self.colors,
                 self._open,
                 extra_overlay=extra,
@@ -1145,6 +1244,10 @@ class VideoBlock(Gtk.Widget):
         self._autoplayed = False
         self._width_hint = max(200, config.CONTENT_MAX_WIDTH)
         self._last_width = -1
+        self._poster_request_url = upscale_image_url(self.poster_url, 800) if self.poster_url else ""
+        self._poster_width = 800
+        self._poster_loaded = False
+        self._poster_attempted = False
         self.set_hexpand(True)
         self.set_vexpand(False)
         self.add_css_class("db-video-frame")
@@ -1230,7 +1333,10 @@ class VideoBlock(Gtk.Widget):
         self.error_label.set_can_target(False)
         self.poster_page.add_overlay(self.error_label)
 
-        self._load_poster()
+        cached = _cached_texture(self.ctx, self._poster_request_url, self._poster_width)
+        if cached is not None:
+            self.picture.set_paintable(cached)
+            self._poster_loaded = True
         self.set_size_request(-1, self._height_for(self._width_hint))
 
     # -- geometry ---------------------------------------------------------- #
@@ -1262,20 +1368,30 @@ class VideoBlock(Gtk.Widget):
 
     # -- poster ------------------------------------------------------------ #
     def _load_poster(self) -> None:
-        if not self.poster_url:
+        if not self.poster_url or self._poster_loaded or self._poster_attempted:
             return
+        cached = _cached_texture(self.ctx, self._poster_request_url, self._poster_width)
+        if cached is not None:
+            self._poster_loaded = True
+            self.picture.set_paintable(cached)
+            return
+        self._poster_attempted = True
 
         def apply(texture) -> None:
             if not self._alive or texture is None:
                 return
             try:
+                self._poster_loaded = True
                 self.picture.set_paintable(texture)
             except Exception:  # noqa: BLE001
                 pass
 
         try:
             self.ctx.images.load(
-                upscale_image_url(self.poster_url, 1280), 1280, 1280, apply
+                self._poster_request_url,
+                self._poster_width,
+                self._poster_width,
+                apply,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -1339,6 +1455,13 @@ class VideoBlock(Gtk.Widget):
     def do_map(self) -> None:
         Gtk.Widget.do_map(self)
         self._mapped = True
+        if not self._poster_loaded and self._poster_request_url:
+            cached = _cached_texture(self.ctx, self._poster_request_url, self._poster_width)
+            if cached is not None:
+                self._poster_loaded = True
+                self.picture.set_paintable(cached)
+            else:
+                _idle_when_mapped(self, self._load_poster)
         if (
             self.plays_inline
             and not self._autoplayed
@@ -1360,6 +1483,13 @@ class VideoBlock(Gtk.Widget):
                 self.stack.set_visible_child_name("poster")
             except Exception:  # noqa: BLE001
                 pass
+        try:
+            if self.picture.get_paintable() is not None:
+                self.picture.set_paintable(None)
+        except Exception:  # noqa: BLE001
+            pass
+        self._poster_loaded = False
+        self._poster_attempted = False
         Gtk.Widget.do_unmap(self)
 
     def do_unroot(self) -> None:
@@ -1591,6 +1721,10 @@ class AudioBlock(Gtk.Box):
         self._attached = False
         self._alive = True
         self._seeking = False
+        self._poster_request_url = upscale_image_url(self.poster_url, 128) if self.poster_url else ""
+        self._poster_width = 128
+        self._poster_loaded = False
+        self._poster_attempted = False
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         row.add_css_class("db-audio-row")
@@ -1653,7 +1787,10 @@ class AudioBlock(Gtk.Box):
             self.time_label.set_label("Unavailable")
 
         if self.poster_url:
-            self._load_poster()
+            cached = _cached_texture(self.ctx, self._poster_request_url, self._poster_width)
+            if cached is not None:
+                self.poster_picture.set_paintable(cached)
+                self._poster_loaded = True
         else:
             icon = _icon("audio-x-generic-symbolic", 24)
             icon.set_halign(Gtk.Align.CENTER)
@@ -1665,17 +1802,30 @@ class AudioBlock(Gtk.Box):
 
     # -- poster ------------------------------------------------------------ #
     def _load_poster(self) -> None:
+        if not self._poster_request_url or self._poster_loaded or self._poster_attempted:
+            return
+        cached = _cached_texture(self.ctx, self._poster_request_url, self._poster_width)
+        if cached is not None:
+            self._poster_loaded = True
+            self.poster_picture.set_paintable(cached)
+            return
+        self._poster_attempted = True
+
         def apply(texture) -> None:
             if not self._alive or texture is None:
                 return
             try:
+                self._poster_loaded = True
                 self.poster_picture.set_paintable(texture)
             except Exception:  # noqa: BLE001
                 pass
 
         try:
             self.ctx.images.load(
-                upscale_image_url(self.poster_url, 320), 320, 320, apply
+                self._poster_request_url,
+                self._poster_width,
+                self._poster_width,
+                apply,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -1736,11 +1886,25 @@ class AudioBlock(Gtk.Box):
         if not self._attached:
             self.session.add_listener(self._on_session_state)
             self._attached = True
+        if not self._poster_loaded and self._poster_request_url:
+            cached = _cached_texture(self.ctx, self._poster_request_url, self._poster_width)
+            if cached is not None:
+                self._poster_loaded = True
+                self.poster_picture.set_paintable(cached)
+            else:
+                _idle_when_mapped(self, self._load_poster)
 
     def do_unmap(self) -> None:
         if self._attached:
             self.session.remove_listener(self._on_session_state)
             self._attached = False
+        try:
+            if self.poster_picture.get_paintable() is not None:
+                self.poster_picture.set_paintable(None)
+        except Exception:  # noqa: BLE001
+            pass
+        self._poster_loaded = False
+        self._poster_attempted = False
         Gtk.Widget.do_unmap(self)
 
     def do_unroot(self) -> None:

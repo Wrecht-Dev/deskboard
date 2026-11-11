@@ -6,6 +6,7 @@ recycled can never raise.
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import gi
@@ -13,9 +14,8 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Pango", "1.0")
-from gi.repository import Adw, Gtk, Pango
+from gi.repository import Adw, GLib, Gtk, Pango
 
-from .. import config
 from ..util import humanize_time, short_number
 from .blocks import render_blocks
 from .html import escape_markup, plain_text
@@ -23,6 +23,135 @@ from .html import escape_markup, plain_text
 _REBLOG_ICON = "media-playlist-repeat-symbolic"
 _LIKE_ICON = "emote-love-symbolic"
 _SHARE_ICON = "edit-copy-symbolic"
+
+
+# --------------------------------------------------------------------------- #
+# height estimation for bound-but-not-yet-mapped rows
+# --------------------------------------------------------------------------- #
+
+_HEIGHT_HINTS: dict[str, int] = {}
+_MAX_HEIGHT_HINTS = 240
+_ESTIMATE_WIDTH = 700.0
+
+
+def _post_key(post: Any) -> str:
+    value = getattr(post, "id", "") or ""
+    return str(value) if value else str(id(post))
+
+
+def _remember_height(post: Any, height: int) -> None:
+    if height <= 0:
+        return
+    key = _post_key(post)
+    _HEIGHT_HINTS.pop(key, None)
+    _HEIGHT_HINTS[key] = int(height)
+    while len(_HEIGHT_HINTS) > _MAX_HEIGHT_HINTS:
+        _HEIGHT_HINTS.pop(next(iter(_HEIGHT_HINTS)))
+
+
+def _clampf(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _estimate_text_height(block: Any) -> float:
+    text = getattr(block, "text", "") or ""
+    if not text.strip():
+        return 0.0
+    chars_per_line = 62.0
+    lines = max(1, int(math.ceil(len(text) / chars_per_line)))
+    line_height = 22.0
+    subtype = str(getattr(block, "subtype", "") or "")
+    extra = 0.0
+    if subtype == "heading1":
+        line_height = 34.0
+        extra = 6.0
+    elif subtype == "heading2":
+        line_height = 28.0
+        extra = 4.0
+    elif subtype == "quote":
+        extra = 6.0
+    return lines * line_height + extra + 8.0
+
+
+def _estimate_media_height(block: Any) -> float:
+    medias = list(getattr(block, "media", None) or [])
+    kind = str(getattr(block, "type", "") or "")
+    if kind == "audio":
+        return 112.0
+    if kind == "video":
+        return 390.0
+    if not medias:
+        return 240.0 if kind == "image" else 0.0
+    aspect = 1.0
+    for media in medias:
+        try:
+            if media.width > 0 and media.height > 0:
+                aspect = media.width / media.height
+                break
+        except Exception:  # noqa: BLE001
+            pass
+    aspect = _clampf(aspect, 0.2, 6.0)
+    count = len(medias)
+    if count <= 1:
+        return _clampf(_ESTIMATE_WIDTH / aspect, 120.0, 640.0)
+    if count == 2:
+        return _clampf((_ESTIMATE_WIDTH - 6.0) / 2.0 / aspect, 100.0, 560.0)
+    if count == 3:
+        return _clampf(_ESTIMATE_WIDTH / 2.0 / aspect + 6.0, 160.0, 760.0)
+    return _clampf((_ESTIMATE_WIDTH - 6.0) / 2.0 / aspect + 6.0, 160.0, 620.0)
+
+
+def _estimate_block_height(block: Any) -> float:
+    kind = str(getattr(block, "type", "") or "text")
+    if kind == "text":
+        return _estimate_text_height(block)
+    if kind in ("image", "video", "audio"):
+        return _estimate_media_height(block) + 14.0
+    if kind == "link":
+        return 104.0
+    if kind == "poll":
+        answers = len(getattr(block, "answers", None) or [])
+        return 74.0 + answers * 42.0
+    if kind == "answer":
+        return 168.0
+    return _estimate_text_height(block)
+
+
+def _estimate_blocks_height(blocks: Any) -> float:
+    total = 0.0
+    for block in blocks or []:
+        try:
+            total += _estimate_block_height(block)
+        except Exception:  # noqa: BLE001
+            total += 30.0
+    return total
+
+
+def _estimate_card_height(post: Any) -> int:
+    key = _post_key(post)
+    hint = _HEIGHT_HINTS.get(key)
+    if hint:
+        return hint
+    height = 116.0  # header + card padding/margins + footer base
+    trail_for_display = getattr(post, "trail_for_display", None)
+    if callable(trail_for_display):
+        try:
+            trail, hidden = trail_for_display(3)
+        except Exception:  # noqa: BLE001
+            trail, hidden = list(getattr(post, "trail", None) or []), 0
+    else:
+        trail, hidden = list(getattr(post, "trail", None) or []), 0
+    if hidden:
+        height += 24.0
+    for item in trail:
+        height += 26.0 + _estimate_blocks_height(getattr(item, "content", None) or [])
+    height += _estimate_blocks_height(getattr(post, "content", None) or [])
+    if getattr(post, "tags", None):
+        height += 26.0
+    height += 20.0  # separator + footer spacing
+    # Estimates run slightly high in practice; bias down so a row that builds
+    # on scroll shrinks rather than jumps open.
+    return int(_clampf(height * 0.87, 120.0, 2400.0))
 
 
 # --------------------------------------------------------------------------- #
@@ -55,23 +184,6 @@ def _dim(label: Gtk.Label) -> None:
     label.add_css_class("dim-label")
 
 
-def _load_avatar(avatar: Adw.Avatar, url: str, size: int, ctx: Any) -> None:
-    if not url:
-        return
-
-    def apply(texture: Any) -> None:
-        try:
-            if texture is not None:
-                avatar.set_custom_image(texture)
-        except Exception:  # noqa: BLE001 - the row may be gone already
-            pass
-
-    try:
-        ctx.images.load(url, size * 2, size * 2, apply)
-    except Exception:  # noqa: BLE001 - avatars are strictly optional
-        pass
-
-
 # --------------------------------------------------------------------------- #
 # PostCard
 # --------------------------------------------------------------------------- #
@@ -84,21 +196,90 @@ class PostCard(Gtk.Box):
         self.post = post
         self.ctx = ctx
         self.add_css_class("post-card")
+        self.set_hexpand(True)
 
-        clamp = Adw.Clamp()
-        clamp.set_maximum_size(int(getattr(config, "CONTENT_MAX_WIDTH", 760) or 760))
-        clamp.set_tightening_threshold(560)
-        clamp.set_halign(Gtk.Align.FILL)
-        clamp.set_hexpand(True)
-        self.append(clamp)
+        # Avatars are queued here and fetched only once this card is mapped.
+        # A Gtk.ListView binds far more rows than it maps, so eager fetching
+        # here would queue hundreds of images for rows nobody ever sees.
+        self._deferred_images: dict[tuple[str, int, int], list[Any]] = {}
+        self._requested_images: set[tuple[str, int]] = set()
+        self._menu_popover: Gtk.Popover | None = None
+        self._built = False
+        self._build_scheduled = False
+        self._inner: Gtk.Box | None = None
+        self._skeleton: Gtk.Box | None = _box(spacing=0)
+        self._skeleton.set_hexpand(True)
+        self._skeleton.set_size_request(-1, _estimate_card_height(post))
+        self.append(self._skeleton)
+        self.connect("map", self._on_map)
 
+    # -- lazy construction -------------------------------------------------- #
+    def _on_map(self, *_args) -> None:
+        if self._built:
+            self._pump_images()
+            return
+        if self._build_scheduled:
+            return
+        # Gtk.ListView maps a row briefly while binding it even when the row is
+        # outside the viewport.  Wait one idle turn and build only if the row is
+        # still mapped; otherwise the skeleton stays until the user scrolls to
+        # it and it is mapped for real.
+        self._build_scheduled = True
+        GLib.idle_add(self._build_if_visible)
+
+    def _build_if_visible(self) -> bool:
+        self._build_scheduled = False
+        if self._built:
+            return False
+        try:
+            if not self.get_mapped():
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        self._built = True
+        self._build_now()
+        self._pump_images()
+        return False
+
+    def _build_now(self) -> None:
+        """Build the real card once the row is mapped."""
+        try:
+            if self._skeleton is not None:
+                self.remove(self._skeleton)
+                self._skeleton = None
+        except Exception:  # noqa: BLE001
+            pass
         inner = _box(spacing=0)
-        clamp.set_child(inner)
+        inner.set_hexpand(True)
+        self._inner = inner
+        self.append(inner)
+        try:
+            self._build_header(inner)
+            self._build_content(inner)
+            self._build_tags(inner)
+            self._build_footer(inner)
+        except Exception:  # noqa: BLE001 - never let one post break the feed
+            try:
+                self.remove(inner)
+            except Exception:  # noqa: BLE001
+                pass
+            fallback = Gtk.Label(label="This post could not be displayed.")
+            fallback.add_css_class("dim-label")
+            fallback.set_margin_top(12)
+            fallback.set_margin_bottom(12)
+            fallback.set_margin_start(16)
+            fallback.set_margin_end(16)
+            self.append(fallback)
+            self._inner = None
+            return
+        GLib.idle_add(self._remember_own_height)
 
-        self._build_header(inner)
-        self._build_content(inner)
-        self._build_tags(inner)
-        self._build_footer(inner)
+    def _remember_own_height(self) -> bool:
+        try:
+            _remember_height(self.post, self.get_height())
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     # -- header ------------------------------------------------------------- #
     def _build_header(self, parent: Gtk.Box) -> None:
@@ -118,7 +299,7 @@ class PostCard(Gtk.Box):
         row = _box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         avatar = Adw.Avatar(size=40, text=display_name or "?", show_initials=True)
         avatar.set_valign(Gtk.Align.START)
-        _load_avatar(avatar, post.blog_avatar, 40, self.ctx)
+        self._defer_avatar(avatar, getattr(post, "blog_avatar", "") or "", 40)
         row.append(avatar)
 
         text = _box(spacing=1)
@@ -170,15 +351,71 @@ class PostCard(Gtk.Box):
         author.set_child(row)
         header.append(author)
 
-        menu = Gtk.MenuButton()
+        menu = Gtk.Button()
         menu.set_icon_name("view-more-symbolic")
         menu.add_css_class("flat")
         menu.set_tooltip_text("More actions")
         menu.set_valign(Gtk.Align.START)
-        menu.set_popover(self._build_menu())
+        menu.connect("clicked", self._show_menu)
         header.append(menu)
 
         parent.append(header)
+
+    # -- deferred images ---------------------------------------------------- #
+    def _defer_avatar(self, avatar: Adw.Avatar, url: str, size: int) -> None:
+        if not url:
+            return
+        width = height = size * 2
+
+        def apply(texture: Any) -> None:
+            try:
+                if texture is not None:
+                    avatar.set_custom_image(texture)
+            except Exception:  # noqa: BLE001 - the row may be gone already
+                pass
+
+        self._deferred_images.setdefault((url, width, height), []).append(apply)
+
+    def _pump_images(self) -> None:
+        if not self._deferred_images:
+            return
+        for (url, width, height), callbacks in list(self._deferred_images.items()):
+            try:
+                texture = self.ctx.images.cached(url, width)
+            except Exception:  # noqa: BLE001
+                texture = None
+            if texture is not None:
+                for callback in callbacks:
+                    callback(texture)
+                continue
+            if (url, width) in self._requested_images:
+                continue
+            self._requested_images.add((url, width))
+
+            def deliver(texture: Any, callbacks=callbacks) -> None:
+                if texture is None:
+                    return
+                for callback in callbacks:
+                    callback(texture)
+
+            try:
+                self.ctx.images.load(url, width, height, deliver)
+            except Exception:  # noqa: BLE001 - avatars are optional
+                pass
+
+    def _show_menu(self, button: Gtk.Button) -> None:
+        popover = self._menu_popover
+        if popover is None:
+            popover = self._build_menu()
+            self._menu_popover = popover
+            try:
+                popover.set_parent(button)
+            except Exception:  # noqa: BLE001
+                return
+        try:
+            popover.popup()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _build_menu(self) -> Gtk.Popover:
         popover = Gtk.Popover()
@@ -276,7 +513,7 @@ class PostCard(Gtk.Box):
             avatar = Adw.Avatar(size=20, text=item.display_name or item.blog_name or "?",
                                 show_initials=True)
             avatar.set_valign(Gtk.Align.CENTER)
-            _load_avatar(avatar, avatar_url, 20, self.ctx)
+            self._defer_avatar(avatar, avatar_url, 20)
             author_row.append(avatar)
 
         name = _label(escape_markup(item.display_name or item.blog_name or ""),

@@ -28,7 +28,9 @@ browser, no JavaScript bundle and no telemetry.
 
 ## Features
 
-- Dashboard, likes, blog feeds, tag pages and search in one window.
+- **Home ("For you") and Following** tabs — both of the dashboard tabs Tumblr's
+  own web client exposes — plus likes, blog feeds, tag pages and search in one
+  window.
 - NPF (Neue Post Format) rendering: paragraphs, headings, quotes, chat, ordered
   and unordered lists, bold/italic/strikethrough links and mentions.
 - Image grids and galleries with largest-rendition selection, HiDPI upscaling,
@@ -36,11 +38,18 @@ browser, no JavaScript bundle and no telemetry.
   audio players.
 - Reblog trails with sensible collapsing ("N earlier reblogs"), avatars, tags,
   relative timestamps and note/like/reblog counts.
-- Infinite scroll with pagination, empty/error states and retry — every network
-  failure becomes an inline message, never a traceback in the window.
+- **Pipelined pagination**: Tumblr serves only ~4 posts per request at
+  0.6–1.2 s each, so Deskboard keeps a couple of pages buffered ahead of the
+  viewport instead of stalling at the bottom of the feed.
+- **Your tags** section in the sidebar, listing the tags you follow (like the
+  desktop site), each one opening its tag feed.
+- Empty/error states and retry everywhere — every network failure becomes an
+  inline message, never a traceback in the window.
 - Like and reblog actions with optimistic UI and rollback when Tumblr refuses.
 - Firefox, Chromium-family, Netscape `cookies.txt`, JSON and pasted-header
-  session import; guest browsing for public blogs, tags and search.
+  session import; guest browsing for public blogs, tags and search. If Tumblr
+  rotates your session cookie, Deskboard re-reads it from the browser once and
+  retries instead of throwing you back to the sign-in page.
 - Light and dark themes, compact mode, NSFW blur and window-state persistence.
 - Keyboard-first navigation.
 - `--demo` offline mode and `--doctor` environment diagnostics.
@@ -50,9 +59,9 @@ browser, no JavaScript bundle and no telemetry.
 Captured from the offline demo (`deskboard --demo`) — real widgets, real
 typography, bundled public sample posts.
 
-| Light | Dark |
+| Home, light | Following, dark |
 | --- | --- |
-| ![Deskboard showing a long reblog trail, headings, lists, tags and post actions](assets/screenshot-dashboard.png) | ![Deskboard in dark mode with a reblog trail and a photo post](assets/screenshot-post.png) |
+| ![Deskboard's Home feed: sidebar with Home, Following, Likes, Your tags, Blogs and Discover, and a post with headings, lists and links](assets/screenshot-home.png) | ![Deskboard in dark mode showing a reblog trail, tags and a photo post](assets/screenshot-post.png) |
 
 ## Requirements
 
