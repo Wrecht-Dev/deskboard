@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Deskboard
+GenericName=Tumblr Dashboard
+Comment=A fast, native Tumblr dashboard
+Exec=deskboard
+Icon=dev.wrecht.Deskboard
+Terminal=false
+Categories=Network;Feed;
+Keywords=tumblr;dashboard;social;microblog;blog;
+StartupNotify=true
+StartupWMClass=dev.wrecht.Deskboard

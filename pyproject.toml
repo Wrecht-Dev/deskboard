@@ -1,0 +1,47 @@
+# Deskboard — minimal packaging metadata.
+#
+# The supported install path is ./scripts/install.sh (no root, XDG prefix).
+# This file exists so `pip install -e .` and standard tooling work too; PyGObject
+# and the GTK 4 typelibs are system libraries and are intentionally not pip
+# dependencies.
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deskboard"
+version = "0.1.0"
+description = "A fast, native Tumblr dashboard for Linux"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Environment :: X11 Applications :: GTK",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+deskboard = "deskboard.__main__:main"
+
+[tool.setuptools]
+packages = ["deskboard", "deskboard.api", "deskboard.services", "deskboard.ui"]
+
+[tool.setuptools.package-data]
+"deskboard.ui" = ["style.css", "media.css"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

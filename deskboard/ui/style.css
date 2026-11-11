@@ -1,0 +1,133 @@
+/* Deskboard — shell stylesheet.
+ *
+ * Only libadwaita 1.x named colors are used so light and dark both work and
+ * nothing here has to know which one is active.  Post-card rules live here
+ * because this file is the single application stylesheet (the cards module
+ * only provides structure); the media module keeps its own prefixed sheet.
+ */
+
+/* ------------------------------------------------------------------ sidebar */
+.deskboard-sidebar {
+  background-color: @sidebar_bg_color;
+}
+
+.sidebar-heading {
+  font-size: 0.78em;
+  font-weight: 800;
+  margin: 16px 12px 4px 12px;
+  opacity: 0.55;
+}
+
+.sidebar-row {
+  min-height: 30px;
+}
+
+.sidebar-row label {
+  font-weight: 500;
+}
+
+.sidebar-icon {
+  opacity: 0.8;
+}
+
+.sidebar-glyph {
+  font-weight: 700;
+  font-size: 0.9em;
+  opacity: 0.45;
+}
+
+.account-footer {
+  border-top: 1px solid alpha(@window_fg_color, 0.10);
+}
+
+/* --------------------------------------------------------------- feed cards */
+.post-row {
+  border-left: 3px solid transparent;
+  border-radius: 16px;
+  padding: 1px 0;
+}
+
+.post-row.selected-post {
+  border-left-color: @accent_color;
+  background-color: alpha(@accent_bg_color, 0.08);
+}
+
+/* Keyboard navigation is shown by the selected post itself, not by the theme's
+ * full-width blue selection paint. */
+.feed-list row:selected,
+.feed-list row:selected:hover {
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  outline: none;
+}
+
+.post-card {
+  background-color: @card_bg_color;
+  border: 1px solid alpha(@window_fg_color, 0.10);
+  border-radius: 14px;
+  padding: 16px 18px;
+  margin: 4px 6px;
+}
+
+.compact .post-card {
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin: 2px 4px;
+}
+
+.post-author {
+  padding: 2px 0;
+}
+
+/* The trail of a reblog is visually quieter than the reblogger's own words. */
+.post-trail {
+  border-left: 2px solid alpha(@window_fg_color, 0.12);
+  padding-left: 10px;
+  margin-left: 2px;
+}
+
+.trail-content {
+  opacity: 0.92;
+}
+
+/* ------------------------------------------------------------ loading states */
+.loading-pill {
+  background-color: @popover_bg_color;
+  border: 1px solid alpha(@window_fg_color, 0.12);
+  border-radius: 999px;
+  padding: 6px 14px;
+}
+
+.feed-state {
+  padding: 24px;
+}
+
+/* ------------------------------------------------------------------ onboarding */
+.onboarding-icon {
+  color: @accent_color;
+}
+
+.onboarding-explanation {
+  font-size: 1.05em;
+  opacity: 0.9;
+}
+
+.caption-heading {
+  font-size: 0.8em;
+  font-weight: 700;
+  opacity: 0.55;
+}
+
+.onboarding-status {
+  font-size: 0.95em;
+}
+
+.onboarding-status.error {
+  color: @error_color;
+}
+
+/* --------------------------------------------------------------------- misc */
+.status-dim {
+  opacity: 0.7;
+}

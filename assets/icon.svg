@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Deskboard application icon.
+  Hand-drawn, self-contained SVG: a rounded light "paper" tile with a bold
+  lowercase "d" in Tumblr blue (#36465d).  No fonts, external images or filters,
+  so every librsvg/ImageMagick/GdkPixbuf renderer produces the same result.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1024"
+     height="1024"
+     viewBox="0 0 1024 1024"
+     role="img"
+     aria-label="Deskboard">
+  <title>Deskboard</title>
+  <desc>A light rounded square with a bold lowercase d in Tumblr blue.</desc>
+
+  <defs>
+    <linearGradient id="paper" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fdfcf9"/>
+      <stop offset="1" stop-color="#eae3d8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded-square background -->
+  <rect x="48" y="48" width="928" height="928" rx="212" ry="212" fill="#fbf8f1"/>
+  <rect x="48" y="48" width="928" height="928" rx="212" ry="212" fill="url(#paper)"/>
+  <rect x="48" y="48" width="928" height="928" rx="212" ry="212"
+        fill="none" stroke="#36465d" stroke-opacity="0.12" stroke-width="8"/>
+
+  <!-- Lowercase "d": a round bowl plus an ascender, both in Tumblr blue. -->
+  <g fill="none" stroke="#36465d" stroke-width="104" stroke-linecap="round">
+    <circle cx="512" cy="628" r="160"/>
+    <path d="M672 260 V 812"/>
+  </g>
+</svg>

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Tooling / test caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data that must never be committed
+data/cache/
+cookies.json
+*.cookies
+*.log
+
+# Screenshots for the README are committed (assets/screenshot-*.png)
+*.pyc
