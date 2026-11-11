@@ -37,7 +37,10 @@ class MainWindow(Adw.ApplicationWindow):
         ctx.window = self
 
         self.feed_page: FeedPage | None = None
+        self.page_widget = None
         self.current_source: FeedSource | None = None
+        self._last_feed_source: FeedSource | None = None
+        self._page_return_source: FeedSource | None = None
         self.onboarding_page = None
         self._settings_window = None
         self._reblog_dialog = None
@@ -101,7 +104,13 @@ class MainWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         header.set_title_widget(self.window_title)
 
-        self.sidebar_toggle = Gtk.Button.new_from_icon_name("go-previous-symbolic")
+        self.back_button = Gtk.Button.new_from_icon_name("go-previous-symbolic")
+        self.back_button.set_tooltip_text("Back")
+        self.back_button.set_visible(False)
+        self.back_button.connect("clicked", lambda *_args: self._back_from_page())
+        header.pack_start(self.back_button)
+
+        self.sidebar_toggle = Gtk.Button.new_from_icon_name("sidebar-show-symbolic")
         self.sidebar_toggle.set_tooltip_text("Show sidebar")
         self.sidebar_toggle.set_visible(False)
         self.sidebar_toggle.connect("clicked", lambda *_args: self._show_sidebar())
@@ -145,6 +154,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_select=self._on_sidebar_select,
             on_search=self.open_search,
             on_sign_in=self.show_onboarding,
+            on_page=self._open_page,
         )
         sidebar_toolbar = Adw.ToolbarView()
         sidebar_header = Adw.HeaderBar()
@@ -289,6 +299,12 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception:  # noqa: BLE001
                 pass
             self.feed_page = None
+        if self.page_widget is not None:
+            try:
+                self._discard_page(self.page_widget)
+            except Exception:  # noqa: BLE001
+                pass
+            self.page_widget = None
 
     # -- feed switching ---------------------------------------------------- #
     def open_feed(self, source) -> None:
@@ -307,6 +323,36 @@ class MainWindow(Adw.ApplicationWindow):
         if self._needs_onboarding(source):
             self.show_onboarding()
             return
+        kind = getattr(source, "kind", "")
+        if kind == "explore":
+            try:
+                from .explore import ExplorePage
+
+                page = ExplorePage(self.ctx)
+                self._persist_feed(source)
+                self.show_page(page, "Explore", "Recommended")
+                try:
+                    self.sidebar.select(source.key)
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            except Exception:  # noqa: BLE001 - fall back to the bare feed
+                pass
+        if kind == "blog" and getattr(source, "value", ""):
+            try:
+                from .blogpage import BlogPage
+
+                page = BlogPage(self.ctx, source.value)
+                title = source.title or source.value
+                self._persist_feed(source)
+                self.show_page(page, title, f"@{source.value}.tumblr.com")
+                try:
+                    self.sidebar.select(source.key)
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            except Exception:  # noqa: BLE001 - fall back to the bare feed
+                pass
         self._show_feed(source)
 
     def open_initial(self, feed: str | None = None) -> None:
@@ -369,6 +415,7 @@ class MainWindow(Adw.ApplicationWindow):
         return getattr(source, "kind", "") in _SESSION_FEEDS
 
     def _show_feed(self, source: FeedSource) -> None:
+        self._clear_page_widget()
         old_page = self.feed_page
         self.feed_page = None
         if old_page is not None:
@@ -377,6 +424,8 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception:  # noqa: BLE001
                 pass
 
+        self._last_feed_source = source
+        self._page_return_source = None
         self.current_source = source
         self.onboarding_page = None
         page = FeedPage(
@@ -402,11 +451,188 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception:  # noqa: BLE001
                 pass
 
+    # -- generic page host ------------------------------------------------ #
+    def show_page(self, widget, title: str, subtitle: str | None = None) -> None:
+        """Show an arbitrary page in the content pane.
+
+        The header (refresh/menu/toasts) stays; back is offered when the page
+        sets a truthy ``on_back`` (callable callbacks are invoked first).  Pages
+        may implement ``refresh()`` for Ctrl+R and ``cleanup()`` for teardown.
+        """
+        if widget is None:
+            return
+        if self._page_return_source is None and self._last_feed_source is not None:
+            self._page_return_source = self._last_feed_source
+        old_page = self.page_widget
+        if old_page is not None and old_page is not widget:
+            self._discard_page(old_page)
+        old_feed = self.feed_page
+        self.feed_page = None
+        if old_feed is not None:
+            try:
+                old_feed.cleanup()
+            except Exception:  # noqa: BLE001
+                pass
+        self.page_widget = widget
+        self.current_source = None
+        self.onboarding_page = None
+        try:
+            self.toolbar.set_content(widget)
+        except Exception:  # noqa: BLE001
+            pass
+        label = str(title or "Deskboard")
+        try:
+            self.window_title.set_title(label)
+            self.window_title.set_subtitle(str(subtitle or ""))
+            self.content_page.set_title(label)
+            self.set_title(f"{label} — {config.APP_NAME}")
+        except Exception:  # noqa: BLE001
+            pass
+        self._update_back_button()
+        try:
+            if self.split.get_collapsed():
+                self.split.set_show_content(True)
+        except Exception:  # noqa: BLE001
+            pass
+        self._update_sidebar_toggle()
+
+    def go_back(self) -> None:
+        """Public alias for the header back button."""
+        self._back_from_page()
+
+    def _back_from_page(self) -> None:
+        widget = self.page_widget
+        if widget is None:
+            return
+        callback = getattr(widget, "on_back", None)
+        if callable(callback):
+            try:
+                callback()
+            except Exception:  # noqa: BLE001
+                pass
+        if self.page_widget is widget:
+            self._restore_previous_view()
+
+    def _restore_previous_view(self) -> None:
+        """Return from a hosted page to the feed the user came from."""
+        source = self._page_return_source or self._last_feed_source
+        self.page_widget = None
+        self._page_return_source = None
+        self._update_back_button()
+        if source is not None:
+            self.open_feed(source)
+        else:
+            self.open_feed(FeedSource("home", title="Home"))
+
+    def _clear_page_widget(self) -> None:
+        page = self.page_widget
+        self.page_widget = None
+        self._update_back_button()
+        if page is not None:
+            self._discard_page(page)
+
+    @staticmethod
+    def _discard_page(page) -> None:
+        cleanup = getattr(page, "cleanup", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _update_back_button(self) -> None:
+        try:
+            widget = self.page_widget
+            self.back_button.set_visible(
+                widget is not None and getattr(widget, "on_back", None) is not None
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _open_page(self, key: str) -> None:
+        """Lazily construct a non-feed page requested by the sidebar."""
+        key = str(key or "")
+        titles = {
+            "notifications": ("Notifications", "Activity"),
+            "messages": ("Messages", "Conversations"),
+            "inbox": ("Inbox", "Asks & submissions"),
+            "drafts": ("Drafts", "Saved posts"),
+            "queue": ("Queue", "Scheduled posts"),
+        }
+        title, subtitle = titles.get(key, (key.title() or "Page", ""))
+        page = None
+        try:
+            if key == "notifications":
+                from .activity import NotificationsPage
+
+                page = NotificationsPage(self.ctx)
+            elif key == "messages":
+                from .messaging import MessagingPage
+
+                page = MessagingPage(self.ctx)
+            elif key in ("inbox", "drafts", "queue"):
+                from .library import DraftsPage, InboxPage, QueuePage
+
+                blog = str(getattr(self.ctx, "user_blog", "") or "")
+                if not blog and getattr(self.ctx, "user_blogs", None):
+                    blog = str(self.ctx.user_blogs[0])
+                if key == "inbox":
+                    page = InboxPage(self.ctx)
+                elif key == "drafts":
+                    page = DraftsPage(self.ctx, blog)
+                else:
+                    page = QueuePage(self.ctx, blog)
+        except Exception as exc:  # noqa: BLE001 - modules/constructors may land later
+            page = self._placeholder_page(title, exc)
+        if page is None:
+            page = self._placeholder_page(title, None)
+        if getattr(page, "on_back", None) is None:
+            page.on_back = True
+        self.show_page(page, title, subtitle)
+        try:
+            self.sidebar.select(key)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _placeholder_page(self, title: str, error: BaseException | None):
+        page = Adw.StatusPage()
+        page.set_icon_name("view-grid-symbolic")
+        page.set_title(title)
+        if error is None:
+            page.set_description("This view is coming in a later update.")
+        else:
+            page.set_description(f"This view is not available yet ({error}).")
+        page.set_vexpand(True)
+        page.on_back = True
+        return page
+
+    def open_post(self, post) -> None:
+        """Open a post permalink page when the detail module is available."""
+        if post is None:
+            return
+        try:
+            from .postdetail import PostDetailPage
+
+            page = PostDetailPage(self.ctx, post, on_back=self._restore_previous_view)
+            handle = str(getattr(post, "handle", "") or "")
+            subtitle = f"@{handle}" if handle else ""
+            self.show_page(page, post.display_name or "Post", subtitle)
+            return
+        except ImportError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            self.toast(f"Couldn't open the post: {exc}")
+        url = str(getattr(post, "post_url", "") or getattr(post, "blog_url", "") or "")
+        if url:
+            self.ctx.open_url(url)
+
     def _feed_subtitle(self, source, count: int | None = None, total: int | None = None) -> str:
         """A short, informative second line for the header."""
         kind = getattr(source, "kind", "")
         if kind == "home":
             base = "For you"
+        elif kind == "explore":
+            base = "Recommended"
         elif kind in ("dashboard", "following"):
             base = "Your dashboard"
         elif kind == "likes":
@@ -468,6 +694,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def show_onboarding(self, *_args) -> None:
         """Swap the content pane to the sign-in page."""
+        self._clear_page_widget()
         old_page = self.feed_page
         self.feed_page = None
         if old_page is not None:
@@ -540,6 +767,16 @@ class MainWindow(Adw.ApplicationWindow):
         if not query:
             self.focus_search()
             return
+        try:
+            from .search import SearchPage
+
+            page = SearchPage(self.ctx, query)
+            self.show_page(page, f"Search: {query}", f"\u201c{query}\u201d")
+            if callable(getattr(page, "focus_posts", None)):
+                page.focus_posts()
+            return
+        except Exception:  # noqa: BLE001 - fall back to the plain post feed
+            pass
         source = FeedSource("search", value=query, title=f"Search: {query}")
         self.open_feed(source)
         if self.feed_page is not None:
@@ -550,6 +787,15 @@ class MainWindow(Adw.ApplicationWindow):
 
     # -- feed actions ------------------------------------------------------ #
     def refresh_current(self) -> None:
+        page = self.page_widget
+        if page is not None:
+            refresh = getattr(page, "refresh", None)
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception as exc:  # noqa: BLE001
+                    self.toast(f"Couldn't refresh: {exc}")
+            return
         if self.feed_page is not None:
             try:
                 self.feed_page.refresh()
@@ -567,7 +813,15 @@ class MainWindow(Adw.ApplicationWindow):
         blog = str(name or "").strip()
         if not blog:
             return
-        self.open_feed(FeedSource("blog", value=blog, title=blog))
+        try:
+            from .blogpage import BlogPage
+
+            page = BlogPage(self.ctx, blog)
+            self.show_page(page, blog, f"@{blog}.tumblr.com")
+            return
+        except Exception:  # noqa: BLE001 - fall back to the plain blog feed
+            pass
+        self._on_open_blog(blog)
 
     def _on_open_tag(self, tag) -> None:
         tag = str(tag or "").strip().lstrip("#")
@@ -583,7 +837,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.toast("Sign in to open your blog.")
             self.show_onboarding()
             return
-        self.open_feed(FeedSource("blog", value=blog, title=blog))
+        self._on_open_blog(blog)
 
     # -- liking ------------------------------------------------------------ #
     def _can_write(self) -> bool:
@@ -873,7 +1127,11 @@ class MainWindow(Adw.ApplicationWindow):
         try:
             collapsed = bool(self.split.get_collapsed())
             showing_content = bool(self.split.get_show_content())
-            self.sidebar_toggle.set_visible(collapsed and showing_content)
+            # On a hosted page the header already has a Back button; don't show
+            # the sidebar toggle in the same slot.
+            self.sidebar_toggle.set_visible(
+                collapsed and showing_content and self.page_widget is None
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -898,6 +1156,11 @@ class MainWindow(Adw.ApplicationWindow):
         if self.feed_page is not None:
             try:
                 self.feed_page.cleanup()
+            except Exception:  # noqa: BLE001
+                pass
+        if self.page_widget is not None:
+            try:
+                self._discard_page(self.page_widget)
             except Exception:  # noqa: BLE001
                 pass
         return False

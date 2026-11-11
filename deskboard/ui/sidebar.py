@@ -23,12 +23,13 @@ from ..api.sources import FeedSource
 class Sidebar(Gtk.Box):
     __gtype_name__ = "DeskboardSidebar"
 
-    def __init__(self, ctx, on_select=None, on_search=None, on_sign_in=None) -> None:
+    def __init__(self, ctx, on_select=None, on_search=None, on_sign_in=None, on_page=None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.ctx = ctx
         self.on_select = on_select
         self.on_search = on_search
         self.on_sign_in = on_sign_in
+        self.on_page = on_page
 
         self._rows: dict[str, Gtk.ListBoxRow] = {}
         self._tag_rows: dict[str, Gtk.ListBoxRow] = {}
@@ -39,6 +40,9 @@ class Sidebar(Gtk.Box):
         self._tags: list[str] = []
         self._tags_loading = False
         self._tags_pending = False
+        self._trending: list[str] = []
+        self._trending_loading = False
+        self._trending_loaded = False
         self._identity_gen = 0
 
         self.set_size_request(268, -1)
@@ -76,6 +80,7 @@ class Sidebar(Gtk.Box):
         self.append(self.footer)
 
         self._rebuild()
+        self._load_trending()
 
     # -- public API -------------------------------------------------------- #
     def select(self, key: str) -> None:
@@ -157,6 +162,14 @@ class Sidebar(Gtk.Box):
                     FeedSource("dashboard", title="Following", icon="system-users-symbolic")
                 )
                 self._add_row(FeedSource("likes", title="Likes", icon="emote-love-symbolic"))
+
+            # Explore is public, so it is available signed out too.
+            self._add_row(
+                FeedSource("explore", title="Explore", icon="view-grid-symbolic")
+            )
+            self._add_trending_group()
+
+            if signed_in:
                 self._add_your_tags_group()
 
                 blogs = [str(name) for name in (getattr(self.ctx, "user_blogs", None) or []) if name]
@@ -166,6 +179,15 @@ class Sidebar(Gtk.Box):
                         self._add_row(
                             FeedSource("blog", value=name, title=name, icon="web-browser-symbolic")
                         )
+
+                # Keep these ungrouped so the Library rows stay reachable without
+                # an extra three section headings between them and the footer.
+                self._add_action_row("messages", "Messages", "mail-message-new-symbolic")
+                self._add_action_row("notifications", "Notifications", "notification-symbolic")
+                self._add_heading("Library")
+                self._add_action_row("inbox", "Inbox", "mail-unread-symbolic")
+                self._add_action_row("drafts", "Drafts", "document-edit-symbolic")
+                self._add_action_row("queue", "Queue", "alarm-symbolic")
 
             self._add_heading("Discover")
             self._add_row(
@@ -235,6 +257,51 @@ class Sidebar(Gtk.Box):
             self._rows[key] = row
         except Exception:  # noqa: BLE001
             pass
+
+    def _add_action_row(self, key: str, label: str, icon_name: str) -> None:
+        """A non-feed sidebar row that asks the window to build a page."""
+        if key in self._rows:
+            return
+        try:
+            row = Gtk.ListBoxRow()
+            row.set_activatable(True)
+            row.add_css_class("sidebar-row")
+            row.page_key = key  # type: ignore[attr-defined]
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            box.set_margin_start(10)
+            box.set_margin_end(10)
+            box.set_margin_top(4)
+            box.set_margin_bottom(4)
+            icon = Gtk.Image.new_from_icon_name(icon_name)
+            icon.set_pixel_size(16)
+            icon.add_css_class("sidebar-icon")
+            box.append(icon)
+            label_widget = Gtk.Label(label=label, xalign=0)
+            label_widget.set_ellipsize(3)
+            label_widget.set_hexpand(True)
+            box.append(label_widget)
+            row.set_child(box)
+            self.listbox.append(row)
+            self._rows[key] = row
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _add_trending_group(self) -> None:
+        if not self._trending:
+            return
+        followed = {tag.lower() for tag in self._tags}
+        shown = 0
+        self._add_heading("Trending tags")
+        for tag in self._trending:
+            if tag.lower() in followed:
+                continue
+            self._add_row(
+                FeedSource("tagged", value=tag, title=f"#{tag}"),
+                marker="#",
+            )
+            shown += 1
+            if shown >= 6:
+                break
 
     # -- footer ------------------------------------------------------------ #
     def _build_footer(self) -> Gtk.Widget:
@@ -325,7 +392,23 @@ class Sidebar(Gtk.Box):
     def _on_row_selected(self, _listbox, row) -> None:
         if self._syncing or row is None:
             return
+        page_key = getattr(row, "page_key", None)
         source = getattr(row, "source", None)
+        if page_key is not None:
+            self._selected_key = str(page_key)
+            try:
+                if self._tags_listbox is not None:
+                    self._syncing = True
+                    self._tags_listbox.unselect_all()
+                    self._syncing = False
+            except Exception:  # noqa: BLE001
+                pass
+            if callable(self.on_page):
+                try:
+                    self.on_page(str(page_key))
+                except Exception:  # noqa: BLE001
+                    pass
+            return
         if source is None:
             return
         self._selected_key = source.key
@@ -458,6 +541,55 @@ class Sidebar(Gtk.Box):
             threading.Thread(target=work, daemon=True, name="sidebar-tags").start()
         except Exception:  # noqa: BLE001
             self._tags_loading = False
+
+    # -- trending tags ----------------------------------------------------- #
+    def _load_trending(self) -> None:
+        if self._trending_loading or self._trending_loaded:
+            return
+        client = self.ctx.client
+        getter = getattr(client, "get_trending_tags", None)
+        if not callable(getter):
+            self._trending_loaded = True
+            return
+        self._trending_loading = True
+
+        def work() -> None:
+            tags: list[str] = []
+            try:
+                raw = getter(limit=20) or []
+                for item in raw:
+                    if isinstance(item, str) and item.strip():
+                        tags.append(item.strip())
+                    elif isinstance(item, dict) and item.get("name"):
+                        tags.append(str(item["name"]).strip())
+            except Exception:  # noqa: BLE001 - the sub-list is a nice-to-have
+                tags = []
+            try:
+                GLib.idle_add(self._apply_trending, tags)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="sidebar-trending").start()
+        except Exception:  # noqa: BLE001
+            self._trending_loading = False
+
+    def _apply_trending(self, tags: list[str]) -> bool:
+        self._trending_loading = False
+        self._trending_loaded = True
+        try:
+            cleaned: list[str] = []
+            seen = set()
+            for tag in tags:
+                key = tag.lower()
+                if tag and key not in seen:
+                    seen.add(key)
+                    cleaned.append(tag)
+            self._trending = cleaned[:20]
+            self._rebuild()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     def _apply_tags(self, generation: int, tags: list[str]) -> bool:
         self._tags_loading = False

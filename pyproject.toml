@@ -33,7 +33,7 @@ deskboard = "deskboard.__main__:main"
 packages = ["deskboard", "deskboard.api", "deskboard.services", "deskboard.ui"]
 
 [tool.setuptools.package-data]
-"deskboard.ui" = ["style.css", "media.css"]
+"deskboard.ui" = ["style.css", "media.css", "messaging.css", "postdetail.css"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

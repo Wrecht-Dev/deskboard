@@ -433,10 +433,16 @@ class FeedPage(Gtk.Box):
         try:
             item = self.store.get_item(position)
             post = getattr(item, "post", None) if item is not None else None
-            if post is not None:
-                url = str(getattr(post, "post_url", "") or getattr(post, "blog_url", "") or "")
-                if url:
-                    self.ctx.open_url(url)
+            if post is None:
+                return
+            window = getattr(self.ctx, "window", None)
+            opener = getattr(window, "open_post", None)
+            if callable(opener):
+                opener(post)
+                return
+            url = str(getattr(post, "post_url", "") or getattr(post, "blog_url", "") or "")
+            if url:
+                self.ctx.open_url(url)
         except Exception:  # noqa: BLE001
             pass
 

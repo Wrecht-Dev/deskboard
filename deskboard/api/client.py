@@ -45,6 +45,19 @@ class TumblrError(Exception):
 
 
 @dataclass
+class ItemPage:
+    """A page of arbitrary API objects (notifications, DMs, drafts...)."""
+
+    items: list[dict] = field(default_factory=list)
+    next_url: str | None = None
+    total: int | None = None
+    raw: dict | list = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.items)
+
+
+@dataclass
 class Page:
     """One page of a paginated collection."""
 
@@ -162,6 +175,15 @@ class TumblrClient:
             except Exception:  # noqa: BLE001 - best effort only
                 pass
             status = exc.code
+            if status == 401 and method != "GET" and retry_auth and "1022" in detail:
+                # stale/absent CSRF token: refresh it and retry exactly once
+                with self._lock:
+                    had_token = bool(self._csrf)
+                    self._csrf = None
+                if self.csrf_token(refresh=True):
+                    return self.request(path, params, method=method, body=body, retry_auth=False)
+                if had_token:
+                    raise TumblrError(_explain(status, detail), status=status, url=url, body=detail) from exc
             if status in (401, 403) and retry_auth and self.cookies and not self._auth_refreshed:
                 self._auth_refreshed = True
                 fresh = None
@@ -208,25 +230,44 @@ class TumblrClient:
         self.token = candidate
         return True
 
-    def csrf_token(self) -> str | None:
-        """Fetch the CSRF token required by write endpoints."""
+    def csrf_token(self, refresh: bool = False) -> str | None:
+        """The per-session CSRF token required by every write endpoint.
+
+        The website embeds it in the dashboard bootstrap as
+        ``"csrfToken":"<value>"`` — sometimes JSON-escaped inside a
+        ``JSON.parse("…")`` payload, which is why the pattern tolerates
+        backslashes. Cached for the session; call with ``refresh=True`` after a
+        401 to pick up a rotated token.
+        """
         with self._lock:
-            if self._csrf:
+            if self._csrf and not refresh:
                 return self._csrf
-        try:
-            request = urllib.request.Request(
-                config.ORIGIN + "/",
-                headers=self._headers({"Accept": "text/html"}),
-            )
-            with urllib.request.urlopen(request, timeout=self.timeout, context=self._ssl) as response:
-                page = response.read().decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001 - write actions will simply fail loudly
-            return None
-        match = re.search(r'"csrfToken":"([^"]+)"', page)
-        if match:
-            with self._lock:
-                self._csrf = match.group(1)
-            return self._csrf
+        import gzip as _gzip
+
+        headers = self._headers({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+        })
+        headers.pop("Accept-Encoding", None)
+        for path in ("/dashboard", "/"):
+            try:
+                request = urllib.request.Request(config.ORIGIN + path, headers=headers)
+                with urllib.request.urlopen(request, timeout=self.timeout, context=self._ssl) as response:
+                    raw = response.read()
+                    if response.headers.get("Content-Encoding") == "gzip":
+                        raw = _gzip.decompress(raw)
+                    page = raw.decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001 - writes will fail with a clear message
+                continue
+            match = re.search(r'csrfToken\\{0,2}"\s*:\s*\\{0,2}"([^"\\]{8,80})', page)
+            if match:
+                with self._lock:
+                    self._csrf = match.group(1)
+                return self._csrf
         return None
 
     # -- pagination -------------------------------------------------------- #
@@ -235,6 +276,9 @@ class TumblrClient:
         return self._to_page(data)
 
     def _to_page(self, data: dict) -> Page:
+        if isinstance(data, list):
+            # some routes (e.g. /v2/tagged) answer with a bare array
+            return Page(posts=parse_posts({"posts": data}), next_url=None, total=None, raw=data)
         response = data.get("response", data) if isinstance(data, dict) else {}
         if isinstance(response, dict) and "response" in response and not response.get("posts"):
             response = response["response"]
@@ -363,24 +407,201 @@ class TumblrClient:
         """Tag pages still live on the older ``/v2/tagged`` route."""
         return self._to_page(self.request("/v2/tagged", {"tag": tag, "limit": limit}))
 
-    def get_notes(self, post_id: str, blog: str = "") -> Page:
-        params = {"limit": 50}
-        if blog:
-            params["tumblelog"] = blog
-        return self._to_page(self.request(f"/v2/notes/{urllib.parse.quote(post_id)}", params))
+    def _to_items(self, data: dict, keys: tuple[str, ...], before_key: str = "before") -> ItemPage:
+        if isinstance(data, list):
+            # some routes answer with a bare top-level array
+            return ItemPage(items=[i for i in data if isinstance(i, dict)],
+                            next_url=None, total=None, raw={"items": data})
+        response = data.get("response", data) if isinstance(data, dict) else {}
+        items: list = []
+        raw: dict = {}
+        if isinstance(response, dict):
+            raw = response
+            for key in keys:
+                value = response.get(key)
+                if isinstance(value, list):
+                    items = value
+                    break
+        elif isinstance(response, list):
+            items = response
+            raw = {"items": response}
+        links = response.get("links") if isinstance(response, dict) else None
+        next_url = None
+        if isinstance(links, dict):
+            nxt = links.get("next")
+            if isinstance(nxt, dict):
+                next_url = nxt.get("href")
+        return ItemPage(items=[i for i in items if isinstance(i, dict)], next_url=next_url,
+                        total=_as_int(get(response, "totalConversations")) if isinstance(response, dict) else None,
+                        raw=raw)
+
+    # -- notifications / activity ------------------------------------------ #
+    def get_notifications(self, blog: str, limit: int = 30, before: str | None = None) -> ItemPage:
+        params: dict[str, Any] = {"limit": limit}
+        if before:
+            params["before"] = before
+        return self._to_items(
+            self.request(f"/v2/blog/{urllib.parse.quote(blog)}/notifications", params),
+            ("notifications", "items"),
+        )
+
+    # -- messaging --------------------------------------------------------- #
+    def get_conversations(self, limit: int = 30, before: str | None = None, requests: bool = False) -> ItemPage:
+        path = "/v2/conversations/requests" if requests else "/v2/conversations"
+        params: dict[str, Any] = {"limit": limit}
+        if before:
+            params["before"] = before
+        return self._to_items(self.request(path, params), ("conversations",))
+
+    def get_conversation(self, conversation_id: str, limit: int = 50, before: str | None = None) -> ItemPage:
+        """Messages in one conversation.
+
+        The route is shared with sending: ``GET /v2/conversations/messages``
+        with ``conversation_id`` (or two ``participant`` names) as the selector.
+        """
+        params: dict[str, Any] = {"conversation_id": conversation_id, "limit": limit}
+        if before:
+            params["before"] = before
+        return self._to_items(
+            self.request("/v2/conversations/messages", params), ("messages", "items")
+        )
+
+    def mark_conversation_read(self, conversation_id: str, participant: str = "") -> None:
+        self.request(
+            "/v2/conversations/mark_as_read",
+            method="POST", body={"conversation_id": conversation_id, "participant": participant},
+        )
+
+    # -- inbox (asks / submissions) ---------------------------------------- #
+    def get_inbox(self, limit: int = 20) -> Page:
+        return self._to_page(self.request("/v2/user/inbox", {"limit": limit}))
+
+    # -- drafts / queue ---------------------------------------------------- #
+    def get_drafts(self, blog: str, limit: int = 20) -> Page:
+        return self._to_page(
+            self.request(f"/v2/blog/{urllib.parse.quote(blog)}/posts/draft", {"limit": limit})
+        )
+
+    def get_queue(self, blog: str, limit: int = 20) -> Page:
+        return self._to_page(
+            self.request(f"/v2/blog/{urllib.parse.quote(blog)}/posts/queue", {"limit": limit})
+        )
+
+    # -- notes ------------------------------------------------------------- #
+    def get_notes(self, blog: str, post_id: str, mode: str = "all", before: str | None = None) -> ItemPage:
+        """Notes on a post: ``GET /v2/blog/{blog}/notes?id=<post id>``."""
+        params: dict[str, Any] = {"id": post_id, "mode": mode}
+        if before:
+            params["beforeTimestamp"] = before
+        return self._to_items(
+            self.request(f"/v2/blog/{urllib.parse.quote(blog)}/notes", params),
+            ("notes", "items"),
+        )
+
+    # -- discovery --------------------------------------------------------- #
+    def search_blogs(self, query: str, limit: int = 20) -> dict:
+        data = self.request("/v2/search/blogs", {"query": query, "limit": limit})
+        response = data.get("response", {})
+        return response if isinstance(response, dict) else {}
+
+    def get_gif_popular(self, offset: int = 0) -> tuple[list[dict], int | None]:
+        data = self.request("/v2/gif/popular", {"offset": offset})
+        response = data.get("response", {}) or {}
+        gifs = [g for g in (response.get("gifs") or []) if isinstance(g, dict)]
+        links = response.get("links") or {}
+        nxt = (links.get("next") or {}).get("href") if isinstance(links, dict) else None
+        next_offset = None
+        if isinstance(nxt, str) and "offset=" in nxt:
+            try:
+                next_offset = int(nxt.split("offset=")[-1].split("&")[0])
+            except ValueError:
+                next_offset = None
+        return gifs, next_offset
+
+    # -- settings ---------------------------------------------------------- #
+    def get_blog_settings(self, blog: str) -> dict:
+        data = self.request(f"/v2/blog/{urllib.parse.quote(blog)}/settings")
+        response = data.get("response", {})
+        return response if isinstance(response, dict) else {}
+
+    def get_user_settings(self) -> dict:
+        data = self.request("/v2/user/settings")
+        response = data.get("response", {})
+        return response if isinstance(response, dict) else {}
+
+    # -- media upload (composer) ------------------------------------------- #
+    def upload_image(self, path: str) -> dict:
+        """Upload a local image through ``POST /v2/media/image`` (multipart)."""
+        return self._upload("/v2/media/image", path, "image")
+
+    def upload_audio(self, path: str) -> dict:
+        return self._upload("/v2/media/audio", path, "audio")
+
+    def _upload(self, path: str, file_path: str, field: str) -> dict:
+        import mimetypes
+        import uuid
+        from pathlib import Path as _Path
+
+        boundary = "----deskboard" + uuid.uuid4().hex
+        file_path = str(_Path(file_path).expanduser())
+        mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        with open(file_path, "rb") as handle:
+            payload = handle.read()
+        parts = [
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; '
+            f'filename="{_Path(file_path).name}"\r\nContent-Type: {mime}\r\n\r\n'.encode(),
+            payload,
+            f"\r\n--{boundary}--\r\n".encode(),
+        ]
+        url = self._absolute(path)
+        request = urllib.request.Request(
+            url, data=b"".join(parts), method="POST",
+            headers=self._headers({
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "X-CSRF": self.csrf_token() or "",
+            }),
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout * 3, context=self._ssl) as response:
+                raw = response.read()
+                if response.headers.get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+                return json.loads(raw.decode("utf-8", "replace") or "{}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            raise TumblrError(_explain(exc.code, detail), status=exc.code, url=url, body=detail) from exc
+        except urllib.error.URLError as exc:
+            raise TumblrError(f"Upload failed: {exc.reason}", url=url) from exc
 
     # -- write endpoints --------------------------------------------------- #
-    def like(self, post: Post) -> None:
-        self.request("/v2/user/like", method="POST", body={"id": post.id, "reblog_key": post.reblog_key})
+    def like(self, post: Post, placement_id: str = "") -> None:
+        body = {"id": post.id, "reblog_key": post.reblog_key}
+        if placement_id:
+            body["placement_id"] = placement_id
+        self.request("/v2/user/like", method="POST", body=body)
 
     def unlike(self, post: Post) -> None:
         self.request("/v2/user/unlike", method="POST", body={"id": post.id, "reblog_key": post.reblog_key})
 
-    def reblog(self, post: Post, blog: str, comment: str = "") -> None:
+    def reblog(self, post: Post, blog: str, comment: str = "", tags: str | list[str] | None = None) -> None:
+        """Reblog ``post`` to ``blog`` with optional commentary and tags."""
+        body: dict[str, Any] = {"id": post.id, "reblog_key": post.reblog_key, "comment": comment}
+        if tags:
+            body["tags"] = ",".join(tags) if isinstance(tags, (list, tuple)) else str(tags)
+        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/post/reblog", method="POST", body=body)
+
+    def reply(self, post: Post, blog: str, text: str, reply_as: str | None = None) -> None:
+        """Reply to a post (the note visible on the post page)."""
         self.request(
-            f"/v2/blog/{urllib.parse.quote(blog)}/post/reblog",
+            "/v2/user/post/reply",
             method="POST",
-            body={"id": post.id, "reblog_key": post.reblog_key, "comment": comment},
+            body={
+                "post_id": post.id,
+                "reply_text": text,
+                "reblog_key": post.reblog_key,
+                "tumblelog": blog,
+                "reply_as": reply_as or blog,
+            },
         )
 
     def follow(self, blog: str) -> None:
@@ -388,6 +609,28 @@ class TumblrClient:
 
     def unfollow(self, blog: str) -> None:
         self.request("/v2/user/unfollow", method="POST", body={"url": blog})
+
+    # -- messaging (writes) ------------------------------------------------ #
+    def send_message(self, conversation_id: str, participant: str, text: str,
+                     participants: list[str] | None = None) -> None:
+        self.request(
+            "/v2/conversations/messages",
+            method="POST",
+            body={
+                "conversation_id": conversation_id,
+                "participant": participant,
+                "participants": participants or [participant],
+                "message": text,
+                "type": "text",
+            },
+        )
+
+    def accept_conversation(self, conversation_id: str, participant: str) -> None:
+        self.request(
+            "/v2/conversations/accept",
+            method="POST",
+            body={"conversation_id": conversation_id, "participant": participant},
+        )
 
 
 # --------------------------------------------------------------------------- #
