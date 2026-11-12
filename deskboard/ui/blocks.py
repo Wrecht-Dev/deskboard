@@ -87,7 +87,6 @@ class VerticalRule(Gtk.Widget):
         self.set_size_request(width, -1)
         self.set_halign(Gtk.Align.START)
         self.set_valign(Gtk.Align.FILL)
-        self.set_vexpand(True)
 
     def do_snapshot(self, snapshot) -> None:  # noqa: N802 - GTK vfunc name
         width = self.get_width()

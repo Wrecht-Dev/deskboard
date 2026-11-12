@@ -676,7 +676,11 @@ def parse_posts(payload: Any) -> list[Post]:
     """
     if not isinstance(payload, dict):
         return []
-    candidates = payload.get("posts")
+    candidates = (
+        payload.get("posts")
+        or payload.get("likedPosts")
+        or payload.get("likes")
+    )
     if candidates is None:
         timeline = payload.get("timeline")
         if isinstance(timeline, dict):

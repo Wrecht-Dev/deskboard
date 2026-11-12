@@ -362,7 +362,13 @@ class TumblrClient:
         return Blog.from_api(response.get("blog") if isinstance(response, dict) else {})
 
     def get_likes(self, limit: int = config.PAGE_SIZE) -> Page:
-        return self._to_page(self.request("/v2/user/likes", {"limit": limit}))
+        """Liked posts. The route answers ``{likedPosts, likedCount, links}``."""
+        data = self.request("/v2/user/likes", {"limit": limit})
+        response = data.get("response", {}) if isinstance(data, dict) else {}
+        page = self._to_page(data)
+        if isinstance(response, dict):
+            page.total = _as_int(response.get("likedCount")) or page.total
+        return page
 
     def get_following(self, limit: int = 50) -> list[Blog]:
         data = self.request("/v2/user/following", {"limit": limit})
@@ -421,6 +427,10 @@ class TumblrClient:
                 value = response.get(key)
                 if isinstance(value, list):
                     items = value
+                    break
+                if isinstance(value, dict) and isinstance(value.get("data"), list):
+                    # conversations answer {"messages": {"data": [...]}}
+                    items = value["data"]
                     break
         elif isinstance(response, list):
             items = response
