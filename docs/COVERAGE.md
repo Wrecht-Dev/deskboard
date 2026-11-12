@@ -128,3 +128,32 @@ field names could not be confirmed without performing the write.
 | 2FA | `/v2/user/tfa/*` | POST | — | excluded (browser security flow) |
 | Premium/Blaze/domains | `/v2/premium/*`, `/v2/blaze/*`, `/v2/ignite/*`, `/v2/domains/*` | various | — | excluded (payments) |
 | Communities | `/v2/communities/*` | various | — | excluded (not in scope) |
+
+## Verification log (latest)
+
+Run against the live account through the real GTK widgets (headless Xvfb),
+counts only — no private content captured.
+
+| Surface | Evidence |
+|---|---|
+| Home / Explore feeds | construct and load; paginated via pipelined buffer |
+| Likes | **19 items** rendered (2,018 total liked) |
+| Tag Latest | loads (`/v2/hubs/{tag}/timeline`, server order) |
+| Tag Top | **7 items**, ordered by note count (server returns same set) |
+| Notifications | constructs, `before`-cursor pagination, 48→98 items observed |
+| Messages | list + thread: **8 messages** rendered, sender alignment, ms ordering |
+| Inbox / Drafts / Queue | construct with correct typed pages and empty states |
+| Composer | opens with blog selector, type switcher, tags, schedule, attachments |
+| Settings | Blogs / Blog settings / Account / User settings / Appearance / Storage |
+| Blog page | public blog header + feed + Ask/Message capability gating |
+| Post detail | post via PostCard + notes (50→97 paginated on a public post) |
+| Maintenance | launcher pins install dir; `--doctor` detects stale installs |
+
+**Known-unverified (not silently claimed):** settings writes (unit-tested,
+never fired at the account), new-conversation send (participant selector, no
+live thread created), `report` field names (partially inferred; errors visible),
+DM history pagination beyond page one (no >50-message thread available), and
+tag "Top" ordering when Tumblr returns an identical set for both sorts.
+
+**Excluded by design:** Premium/Blaze/ignite purchases, domain management,
+communities, 2FA and login/password recovery, session management.
