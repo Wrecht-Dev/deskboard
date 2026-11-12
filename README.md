@@ -50,7 +50,9 @@ browser, no JavaScript bundle and no telemetry.
   identical set for both, Top additionally orders by note count.
 - Empty/error states and retry everywhere — every network failure becomes an
   inline message, never a traceback in the window.
-- Like and reblog actions with optimistic UI and rollback when Tumblr refuses.
+- Like, reblog (with text / post-only / scheduled), follow, reply, **send asks**
+  and **submit posts**, plus message requests and notifications follow-back —
+  all with optimistic UI and rollback when Tumblr refuses.
 - Firefox, Chromium-family, Netscape `cookies.txt`, JSON and pasted-header
   session import; guest browsing for public blogs, tags and search. If Tumblr
   rotates your session cookie, Deskboard re-reads it from the browser once and
@@ -58,6 +60,9 @@ browser, no JavaScript bundle and no telemetry.
 - Light and dark themes, compact mode, NSFW blur and window-state persistence.
 - Keyboard-first navigation.
 - `--demo` offline mode and `--doctor` environment diagnostics.
+
+The full endpoint inventory, feature matrix and verification log live in
+[`docs/COVERAGE.md`](docs/COVERAGE.md).
 
 ## Screenshots
 
