@@ -555,6 +555,45 @@ class TumblrClient:
         data = self.request(f"/v2/blog/{urllib.parse.quote(blog)}/posts", method="POST", body=body)
         return data.get("response", {}) if isinstance(data, dict) else {}
 
+    # -- notes moderation -------------------------------------------------- #
+    def delete_note(self, blog: str, note_tumblelog: str, note_created_time: str | int,
+                    post_id: str, scope: str = "") -> None:
+        """Delete a note (e.g. your own reply) from a post."""
+        body = {"note_tumblelog": note_tumblelog, "note_created_time": note_created_time,
+                "post_id": post_id}
+        if scope:
+            body["scope"] = scope
+        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/notes/delete", method="POST", body=body)
+
+    def flag_note(self, blog: str, flagged_blog: str, note_created_time: str | int = "") -> None:
+        """Report a note on one of your posts."""
+        body: dict[str, Any] = {"flagged_note_tumblelog_name": flagged_blog}
+        if note_created_time:
+            body["flagged_note_created_time"] = note_created_time
+        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/notes/flag", method="POST", body=body)
+
+    def delete_reply(self, blog: str, post_id: str, reply_id: str) -> None:
+        """Delete a reply from a post (your own reply)."""
+        self.request(
+            f"/v2/blog/{urllib.parse.quote(blog)}/post/{urllib.parse.quote(post_id)}"
+            f"/replies/{urllib.parse.quote(reply_id)}",
+            method="DELETE",
+        )
+
+    # -- post muting (in-feed) --------------------------------------------- #
+    def mute_post(self, post: Post, seconds: int | None = None) -> None:
+        body = {"mute_length_seconds": seconds} if seconds else None
+        self.request(
+            f"/v2/blog/{urllib.parse.quote(post.blog_name)}/posts/{urllib.parse.quote(post.id)}/mute",
+            method="POST", body=body,
+        )
+
+    def unmute_post(self, post: Post) -> None:
+        self.request(
+            f"/v2/blog/{urllib.parse.quote(post.blog_name)}/posts/{urllib.parse.quote(post.id)}/mute",
+            method="DELETE",
+        )
+
     # -- media upload (composer) ------------------------------------------- #
     def upload_image(self, path: str) -> dict:
         """Upload a local image and return the Tumblr **media object**.
