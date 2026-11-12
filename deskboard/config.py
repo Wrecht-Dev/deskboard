@@ -7,7 +7,7 @@ from pathlib import Path
 APP_ID = "dev.wrecht.Deskboard"
 APP_NAME = "Deskboard"
 APP_TAGLINE = "A fast, native Tumblr dashboard"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 # Tumblr's own website talks to this origin for its internal ("kraken") API.
 ORIGIN = "https://www.tumblr.com"
