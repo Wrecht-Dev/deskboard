@@ -782,6 +782,52 @@ def _conversation_recipient(conversation: Any, ctx: Any = None) -> str:
     return names[0] if names else ""
 
 
+def _normalize_participant_name(value: Any) -> str:
+    """Accept a blog name, ``@name``, a blog URL or a Blog-like object."""
+    if isinstance(value, dict):
+        value = _first_str(value, "name", "blogName", "blog_name", "title")
+    elif not isinstance(value, str):
+        value = str(
+            getattr(value, "name", "")
+            or getattr(value, "blog_name", "")
+            or getattr(value, "blogName", "")
+            or ""
+        )
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.casefold()
+    if lowered.startswith(("http://", "https://")):
+        text = text.split("//", 1)[-1].split("/", 1)[0]
+        lowered = text.casefold()
+    if lowered.startswith("www."):
+        text = text[4:]
+        lowered = text.casefold()
+    if lowered.endswith(".tumblr.com"):
+        text = text[: -len(".tumblr.com")]
+    return text.strip().lstrip("@")
+
+
+def _conversation_matches_participant(conversation: Any, target: str) -> bool:
+    wanted = _normalize_participant_name(target).casefold()
+    if not wanted:
+        return False
+    for person in _participants_raw(conversation):
+        # The account owner is listed in every conversation; never treat it as
+        # a DM target (otherwise "message my own blog" matches every thread).
+        if isinstance(person, dict) and as_bool(person.get("primary")):
+            continue
+        if wanted in {
+            _person_name(person).casefold(),
+            _person_blog(person).casefold(),
+            _person_display(person).casefold(),
+        }:
+            return True
+        if wanted in _participant_tokens(person):
+            return True
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # tiny widget helpers
 # --------------------------------------------------------------------------- #
@@ -1436,6 +1482,7 @@ class _ConversationTab(Gtk.Box):
                 self._show_state("content")
                 self._sync_footer()
                 self._schedule_fill()
+            self._notify_loaded()
             return False
         except Exception as exc:  # noqa: BLE001
             try:
@@ -1444,6 +1491,7 @@ class _ConversationTab(Gtk.Box):
                     self._show_error(self._error)
             except Exception:  # noqa: BLE001
                 pass
+            self._notify_loaded()
             return False
 
     def _append(self, items: list) -> int:
@@ -1461,6 +1509,15 @@ class _ConversationTab(Gtk.Box):
                 continue
         return added
 
+    def _notify_loaded(self) -> None:
+        """Tell the page a tab's first request settled (used by open_dm)."""
+        try:
+            callback = getattr(self.owner, "_on_tab_loaded", None)
+            if callable(callback):
+                callback(self)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _show_unsupported(self) -> None:
         demo = bool(getattr(self.ctx, "demo", False))
         description = (
@@ -1476,6 +1533,7 @@ class _ConversationTab(Gtk.Box):
             pass
         self._show_state("empty")
         self._set_footer(None)
+        self._notify_loaded()
 
     def _show_error(self, message: str) -> None:
         try:
@@ -1486,6 +1544,7 @@ class _ConversationTab(Gtk.Box):
             self._set_footer(None)
         except Exception:  # noqa: BLE001
             pass
+        self._notify_loaded()
 
     # -- pagination / scroll ------------------------------------------------ #
     def _adjustment(self):
@@ -1697,6 +1756,7 @@ class ConversationPage(Gtk.Box):
         self._recipients = _conversation_recipients(self.conversation, ctx)
         self._recipient = self._recipients[0] if self._recipients else ""
         self._can_send = _conversation_can_send(self.conversation)
+        self._new_conversation = as_bool(self.conversation.get("_new_conversation"))
 
         # composer / write state
         self._send_inflight = False
@@ -1852,6 +1912,8 @@ class ConversationPage(Gtk.Box):
         self.menu_button.set_valign(Gtk.Align.CENTER)
         self._actions_popover = self._build_actions_popover()
         self.menu_button.set_popover(self._actions_popover)
+        # A not-yet-created conversation has no id to delete/report yet.
+        self.menu_button.set_visible(not self._new_conversation)
         header.append(self.menu_button)
         return header
 
@@ -2118,6 +2180,12 @@ class ConversationPage(Gtk.Box):
         return box
 
     def _build_empty_page(self) -> Gtk.Widget:
+        if self._new_conversation:
+            return _status_page(
+                "mail-unread-symbolic",
+                "Start a new conversation",
+                "Send the first message — it appears here once Tumblr accepts it.",
+            )
         return _status_page(
             "mail-unread-symbolic",
             "No messages yet",
@@ -2219,7 +2287,7 @@ class ConversationPage(Gtk.Box):
             if demo:
                 return "Sending isn't available in the offline demo."
             return "Sending isn't available with this Tumblr client."
-        if not self._conversation_id:
+        if not self._conversation_id and not self._new_conversation:
             return "This conversation can't be messaged."
         if not self._recipient:
             return "Can't reply in this conversation."
@@ -3079,6 +3147,7 @@ class MessagingPage(Gtk.Box):
         self.ctx = ctx
         self._destroyed = False
         self._accept_inflight: set[str] = set()
+        self._dm_target = ""
         self.conversation_page: ConversationPage | None = None
 
         # Adw.ViewSwitcher only accepts an Adw.ViewStack, so the tab stack is
@@ -3187,6 +3256,115 @@ class MessagingPage(Gtk.Box):
                 page.unparent()
             except Exception:  # noqa: BLE001
                 pass
+
+    # -- direct messages from other pages ---------------------------------- #
+    def open_dm(self, participant) -> None:
+        """Open (or start) a DM with ``participant`` from another page.
+
+        ``participant`` may be a blog name, ``@name``, a blog URL or a
+        Blog-like object.  Matching is deferred until the conversation lists
+        have loaded, then an existing thread is opened; otherwise a minimal
+        new-conversation composer is shown.
+        """
+        target = _normalize_participant_name(participant)
+        if not target or self._destroyed:
+            return
+        identity = {
+            _normalize_participant_name(getattr(self.ctx, "user_name", "")).casefold(),
+            _normalize_participant_name(getattr(self.ctx, "user_blog", "")).casefold(),
+        } - {""}
+        if target.casefold() in identity:
+            self._toast("That's your own blog.")
+            return
+        self._dm_target = target
+        if self._open_found_dm(target):
+            return
+        for tab in (self.inbox_tab, self.requests_tab):
+            try:
+                tab.ensure_loaded()
+            except Exception:  # noqa: BLE001
+                pass
+        # A tab that was already loaded may have been searched above; run one
+        # idle pass in case a load finished between construction and this call.
+        try:
+            GLib.idle_add(self._maybe_open_dm)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _find_dm_conversation(self, target: str):
+        for name, tab in (("inbox", self.inbox_tab), ("requests", self.requests_tab)):
+            try:
+                if not tab._loaded:
+                    continue
+                for index in range(tab.store.get_n_items()):
+                    conversation = getattr(tab.store.get_item(index), "conversation", None)
+                    if isinstance(conversation, dict) and _conversation_matches_participant(
+                        conversation, target
+                    ):
+                        return name, conversation
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    def _open_found_dm(self, target: str) -> bool:
+        found = self._find_dm_conversation(target)
+        if not found:
+            return False
+        tab_name, conversation = found
+        self._dm_target = ""
+        try:
+            self.view_stack.set_visible_child_name(tab_name)
+        except Exception:  # noqa: BLE001
+            pass
+        self.open_conversation(conversation)
+        return True
+
+    def _maybe_open_dm(self) -> bool:
+        target = self._dm_target
+        if not target or self._destroyed:
+            return False
+        if self._open_found_dm(target):
+            return False
+        tabs = (self.inbox_tab, self.requests_tab)
+        if any(not tab._loaded or tab._inflight for tab in tabs):
+            for tab in tabs:
+                try:
+                    tab.ensure_loaded()
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
+        # Both lists settled without a match: start a new conversation.
+        self._dm_target = ""
+        self._open_new_dm(target)
+        return False
+
+    def _open_new_dm(self, target: str) -> None:
+        conversation = {
+            "id": "",
+            "participants": [
+                {
+                    "name": target,
+                    "blogName": target,
+                    "title": target,
+                    "canMessage": True,
+                }
+            ],
+            "messages": [],
+            "unreadMessagesCount": 0,
+            "canSend": True,
+            "pending": False,
+            "isPossibleSpam": False,
+            "_new_conversation": True,
+        }
+        self.open_conversation(conversation)
+
+    def _on_tab_loaded(self, _tab) -> None:
+        if not self._dm_target:
+            return
+        try:
+            GLib.idle_add(self._maybe_open_dm)
+        except Exception:  # noqa: BLE001
+            pass
 
     def show_list(self) -> None:
         self._close_conversation()

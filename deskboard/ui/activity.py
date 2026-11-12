@@ -110,6 +110,8 @@ class NotificationsPage(Gtk.Box):
         self._blog = ""
         self._blog_waiting = False
         self._marked_read = False
+        self._follow_back_inflight: set[str] = set()
+        self._followed_back: set[str] = set()
         self._resolve_blog()
 
         self.store = Gio.ListStore(item_type=NotificationItem)
@@ -604,7 +606,27 @@ class NotificationsPage(Gtk.Box):
         button.set_child(box)
         if actor:
             button.connect("clicked", lambda *_args: self._open_blog(actor))
-        return button
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        outer.set_hexpand(True)
+        outer.append(button)
+        if self._can_follow_back(notification, actor):
+            follow = Gtk.Button(label="Follow back")
+            follow.add_css_class("pill")
+            follow.add_css_class("notification-follow")
+            follow.set_valign(Gtk.Align.CENTER)
+            follow.set_margin_end(10)
+            if actor in self._followed_back:
+                follow.set_visible(False)
+            elif actor in self._follow_back_inflight:
+                follow.set_sensitive(False)
+                follow.set_label("Following…")
+            follow.connect(
+                "clicked",
+                lambda _button, name=actor, widget=follow: self._follow_back(name, widget),
+            )
+            outer.append(follow)
+        return outer
 
     def _load_avatar(self, notification: dict, holder: Gtk.Widget, row: Gtk.Widget) -> None:
         url = _avatar_url(notification)
@@ -612,12 +634,23 @@ class NotificationsPage(Gtk.Box):
             return
         notif_id = str(notification.get("id") or "")
         avatar = None
+
+        def find_avatar(widget):
+            if isinstance(widget, Adw.Avatar):
+                return widget
+            try:
+                child = widget.get_first_child()
+            except Exception:  # noqa: BLE001
+                child = None
+            while child is not None:
+                found = find_avatar(child)
+                if found is not None:
+                    return found
+                child = child.get_next_sibling()
+            return None
+
         try:
-            box = row.get_child() if isinstance(row, Gtk.Button) else None
-            if box is not None:
-                first = box.get_first_child()
-                if isinstance(first, Adw.Avatar):
-                    avatar = first
+            avatar = find_avatar(row)
         except Exception:  # noqa: BLE001
             avatar = None
         if avatar is None:
@@ -639,6 +672,86 @@ class NotificationsPage(Gtk.Box):
             self.ctx.images.load(url, 64, 64, apply)
         except Exception:  # noqa: BLE001
             pass
+
+    def _can_follow_back(self, notification: dict, actor: str) -> bool:
+        if not actor:
+            return False
+        if bool(getattr(self.ctx, "demo", False)):
+            return False
+        try:
+            if not self.ctx.is_signed_in:
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        if actor in self._followed_back:
+            return False
+        own = {str(getattr(self.ctx, "user_name", "") or "").lower()}
+        own.add(str(getattr(self.ctx, "user_blog", "") or "").lower())
+        for name in getattr(self.ctx, "user_blogs", None) or []:
+            own.add(str(name or "").lower())
+        if actor.lower() in own:
+            return False
+        kind = str(notification.get("type") or "").lower()
+        following_you = bool(notification.get("followingYou"))
+        if kind not in ("follower", "follow") and not following_you:
+            return False
+        if notification.get("followed") is True:
+            return False
+        if notification.get("mutuals"):
+            return False
+        return True
+
+    def _follow_back(self, actor: str, button: Gtk.Button) -> None:
+        if not actor or actor in self._follow_back_inflight:
+            return
+        try:
+            if not self.ctx.is_signed_in:
+                return
+        except Exception:  # noqa: BLE001
+            return
+        client = self.ctx.client
+        follow = getattr(client, "follow", None)
+        if not callable(follow):
+            self.ctx.toast("Following isn't available with this client.")
+            return
+        self._follow_back_inflight.add(actor)
+        try:
+            button.set_sensitive(False)
+            button.set_label("Following…")
+        except Exception:  # noqa: BLE001
+            pass
+
+        def work() -> None:
+            error = ""
+            try:
+                follow(actor)
+            except Exception as exc:  # noqa: BLE001
+                error = " ".join(str(exc).split()) or "Tumblr refused the request."
+            try:
+                GLib.idle_add(self._finish_follow_back, actor, button, error)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="activity-follow").start()
+        except Exception as exc:  # noqa: BLE001
+            self._finish_follow_back(actor, button, str(exc))
+
+    def _finish_follow_back(self, actor: str, button: Gtk.Button, error: str) -> bool:
+        self._follow_back_inflight.discard(actor)
+        try:
+            if error:
+                button.set_label("Follow back")
+                button.set_sensitive(True)
+                self.ctx.toast(f"Couldn't follow @{actor}: {error}")
+            else:
+                self._followed_back.add(actor)
+                button.set_label("Following")
+                button.set_sensitive(False)
+                self.ctx.toast(f"Following @{actor}")
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     def _open_blog(self, name: str) -> None:
         try:

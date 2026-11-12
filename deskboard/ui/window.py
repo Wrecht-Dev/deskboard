@@ -643,6 +643,28 @@ class MainWindow(Adw.ApplicationWindow):
         page.on_back = True
         return page
 
+    # -- messages ---------------------------------------------------------- #
+    def open_messages_with(self, participant: str) -> None:
+        """Open Messages and start/find a DM composer for a blog."""
+        participant = str(participant or "").strip().lstrip("@")
+        if not participant:
+            return
+        if bool(getattr(self.ctx, "demo", False)):
+            self.toast("Messaging isn't available in the demo.")
+            return
+        try:
+            page = self.page_widget
+            if page is None or type(page).__name__ != "MessagingPage":
+                self._open_page("messages")
+                page = self.page_widget
+            opener = getattr(page, "open_dm", None)
+            if callable(opener):
+                opener(participant)
+            else:
+                self.toast("Messaging isn't available with this build.")
+        except Exception as exc:  # noqa: BLE001
+            self.toast(f"Couldn't open messages: {exc}")
+
     # -- composer ---------------------------------------------------------- #
     def open_composer(self, attachments=None) -> None:
         """Open the writing window, optionally with uploaded media."""

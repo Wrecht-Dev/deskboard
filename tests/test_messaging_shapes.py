@@ -138,3 +138,29 @@ def test_message_key_is_unique_at_millisecond_precision():
         dict(MESSAGES[0], ts="1794427014001", content={"text": "same"}),
     ]
     assert messaging._message_key(twins[0]) != messaging._message_key(twins[1])
+
+
+def test_participant_normalisation_accepts_handle_url_and_object():
+    from types import SimpleNamespace
+
+    assert messaging._normalize_participant_name("@Sample_Writer") == "Sample_Writer"
+    assert messaging._normalize_participant_name(
+        "https://sample_writer.tumblr.com/"
+    ) == "sample_writer"
+    assert messaging._normalize_participant_name(
+        SimpleNamespace(name="sample_writer")
+    ) == "sample_writer"
+    assert messaging._normalize_participant_name({"name": "sample_writer"}) == "sample_writer"
+
+
+def test_open_dm_matching_uses_participant_identity():
+    assert messaging._conversation_matches_participant(
+        CONVERSATION, "sample_writer") is True
+    assert messaging._conversation_matches_participant(
+        CONVERSATION, "@sample_writer") is True
+    assert messaging._conversation_matches_participant(
+        CONVERSATION, "t:other-key-bbbb") is True
+    # The account owner is listed in every conversation but is not a DM target.
+    assert messaging._conversation_matches_participant(CONVERSATION, "demo") is False
+    assert messaging._conversation_matches_participant(
+        CONVERSATION, "someone_else") is False

@@ -19,6 +19,8 @@ from ..api.sources import FeedSource
 from ..util import short_number
 from .feed import FeedPage
 
+_ASK_LIMIT = 500
+
 class BlogPage(Gtk.Box):
     __gtype_name__ = "DeskboardBlogPage"
 
@@ -32,6 +34,7 @@ class BlogPage(Gtk.Box):
         self._open_url = ""
         self._following = False
         self._follow_inflight = False
+        self._ask_dialog = None
 
         self.header = self._build_header()
         self.append(self.header)
@@ -117,6 +120,20 @@ class BlogPage(Gtk.Box):
         self.follow_button.connect("clicked", lambda *_args: self._on_follow_clicked())
         actions.append(self.follow_button)
 
+        self.ask_button = Gtk.Button(label="Ask")
+        self.ask_button.add_css_class("pill")
+        self.ask_button.set_valign(Gtk.Align.CENTER)
+        self.ask_button.set_visible(False)
+        self.ask_button.connect("clicked", lambda *_args: self._on_ask_clicked())
+        actions.append(self.ask_button)
+
+        self.message_button = Gtk.Button(label="Message")
+        self.message_button.add_css_class("pill")
+        self.message_button.set_valign(Gtk.Align.CENTER)
+        self.message_button.set_visible(False)
+        self.message_button.connect("clicked", lambda *_args: self._on_message_clicked())
+        actions.append(self.message_button)
+
         self.open_button = Gtk.Button.new_from_icon_name("web-browser-symbolic")
         self.open_button.set_tooltip_text("Open in browser")
         self.open_button.set_valign(Gtk.Align.CENTER)
@@ -189,6 +206,8 @@ class BlogPage(Gtk.Box):
                 self.info_label.set_text(error or "Couldn't load blog details.")
                 self.info_row.set_visible(True)
                 self.follow_button.set_sensitive(bool(self.blog_name))
+                self.ask_button.set_visible(False)
+                self.message_button.set_visible(False)
                 return False
             self._blog = blog
             name = str(getattr(blog, "name", "") or self.blog_name)
@@ -218,6 +237,23 @@ class BlogPage(Gtk.Box):
             self._following = bool(getattr(blog, "is_following", False))
             self.follow_button.set_sensitive(True)
             self._sync_follow_button()
+            demo = bool(getattr(self.ctx, "demo", False))
+            ask = bool(getattr(blog, "ask", False))
+            self.ask_button.set_visible(ask)
+            self.ask_button.set_sensitive(ask and not demo)
+            self.ask_button.set_tooltip_text(
+                "Asks aren't available in the demo."
+                if demo and ask
+                else ("Ask this blog a question" if ask else None)
+            )
+            can_message = bool(getattr(blog, "can_message", False))
+            self.message_button.set_visible(can_message)
+            self.message_button.set_sensitive(can_message and not demo)
+            self.message_button.set_tooltip_text(
+                "Messaging isn't available in the demo."
+                if demo and can_message
+                else ("Message this blog" if can_message else None)
+            )
             self.info_row.set_visible(False)
             # Keep the window title in sync once the real blog title is known.
             window = getattr(self.ctx, "window", None)
@@ -246,6 +282,184 @@ class BlogPage(Gtk.Box):
             self.ctx.images.load(url, 128, 128, apply)
         except Exception:  # noqa: BLE001
             pass
+
+    # -- ask / message ----------------------------------------------------- #
+    def _on_ask_clicked(self) -> None:
+        if bool(getattr(self.ctx, "demo", False)):
+            self.ctx.toast("Asks aren't available in the demo.")
+            return
+        blog = self._blog
+        if blog is None or not bool(getattr(blog, "ask", False)):
+            return
+        if self._ask_dialog is not None:
+            try:
+                self._ask_dialog.present(self)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        name = str(getattr(blog, "name", "") or self.blog_name)
+        try:
+            dialog = Adw.Dialog()
+            dialog.set_title(f"Ask @{name}")
+            try:
+                dialog.set_content_width(540)
+                dialog.set_content_height(440)
+            except Exception:  # noqa: BLE001
+                pass
+            toolbar = Adw.ToolbarView()
+            header = Adw.HeaderBar()
+            header.set_title_widget(Adw.WindowTitle(title=f"Ask @{name}", subtitle=""))
+            cancel = Gtk.Button(label="Cancel")
+            cancel.add_css_class("flat")
+            cancel.connect("clicked", lambda *_args: dialog.close())
+            header.pack_start(cancel)
+            send = Gtk.Button(label="Send")
+            send.add_css_class("suggested-action")
+            send.set_sensitive(False)
+            header.pack_end(send)
+            toolbar.add_top_bar(header)
+
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            body.set_margin_start(16)
+            body.set_margin_end(16)
+            body.set_margin_top(14)
+            body.set_margin_bottom(10)
+            caption = Gtk.Label(label="Your question", xalign=0)
+            caption.add_css_class("caption")
+            body.append(caption)
+            view = Gtk.TextView()
+            view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            view.set_top_margin(10)
+            view.set_bottom_margin(10)
+            view.set_left_margin(10)
+            view.set_right_margin(10)
+            view.set_hexpand(True)
+            view.set_vexpand(True)
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.set_child(view)
+            scroller.set_min_content_height(180)
+            scroller.set_vexpand(True)
+            body.append(scroller)
+
+            counter = Gtk.Label(label=f"0/{_ASK_LIMIT}", xalign=1)
+            counter.add_css_class("caption")
+            counter.add_css_class("dim-label")
+            body.append(counter)
+
+            anonymous = None
+            if bool(getattr(blog, "ask_anon", False)):
+                anonymous = Gtk.CheckButton(label="Ask anonymously")
+                anonymous.set_active(False)
+                body.append(anonymous)
+
+            error_label = Gtk.Label(label="")
+            error_label.set_wrap(True)
+            error_label.set_xalign(0)
+            error_label.add_css_class("composer-error")
+            error_label.set_visible(False)
+            body.append(error_label)
+            toolbar.set_content(body)
+            dialog.set_child(toolbar)
+
+            def text() -> str:
+                buffer = view.get_buffer()
+                return buffer.get_text(
+                    buffer.get_start_iter(), buffer.get_end_iter(), True
+                ).strip()
+
+            def changed(_buffer=None) -> None:
+                value = text()
+                try:
+                    counter.set_text(f"{len(value)}/{_ASK_LIMIT}")
+                    over = len(value) > _ASK_LIMIT
+                    if over:
+                        counter.add_css_class("composer-error")
+                    else:
+                        counter.remove_css_class("composer-error")
+                    send.set_sensitive(bool(value) and not over)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            view.get_buffer().connect("changed", changed)
+
+            def submit() -> None:
+                question = text()
+                if not question:
+                    return
+                if len(question) > _ASK_LIMIT:
+                    error_label.set_text(f"Questions are limited to {_ASK_LIMIT} characters.")
+                    error_label.set_visible(True)
+                    return
+                sender = getattr(self.ctx.client, "send_ask", None)
+                if not callable(sender):
+                    error_label.set_text("Asks aren't available with this Tumblr client.")
+                    error_label.set_visible(True)
+                    return
+                error_label.set_visible(False)
+                send.set_sensitive(False)
+                send.set_label("Sending…")
+                anon = bool(anonymous.get_active()) if anonymous is not None else False
+                client = self.ctx.client
+
+                def work() -> None:
+                    error = ""
+                    try:
+                        sender(name, question, anon)
+                    except Exception as exc:  # noqa: BLE001
+                        error = " ".join(str(exc).split()) or "Tumblr refused the request."
+                    try:
+                        GLib.idle_add(finish, error)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                def finish(error: str) -> bool:
+                    try:
+                        if error:
+                            send.set_sensitive(True)
+                            send.set_label("Send")
+                            error_label.set_text(f"Couldn't send your ask: {error}")
+                            error_label.set_visible(True)
+                        else:
+                            dialog.close()
+                            self.ctx.toast("Ask sent")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return False
+
+                try:
+                    threading.Thread(target=work, daemon=True, name="blog-ask").start()
+                except Exception as exc:  # noqa: BLE001
+                    finish(str(exc))
+
+            send.connect("clicked", lambda *_args: submit())
+
+            def closed(_dialog) -> None:
+                self._ask_dialog = None
+
+            dialog.connect("closed", closed)
+            self._ask_dialog = dialog
+            dialog.present(self)
+        except Exception as exc:  # noqa: BLE001
+            self._ask_dialog = None
+            self.ctx.toast(f"Couldn't open the ask dialog: {exc}")
+
+    def _on_message_clicked(self) -> None:
+        if bool(getattr(self.ctx, "demo", False)):
+            self.ctx.toast("Messaging isn't available in the demo.")
+            return
+        name = str(getattr(self._blog, "name", "") or self.blog_name)
+        if not name:
+            return
+        window = getattr(self.ctx, "window", None)
+        try:
+            opener = getattr(window, "open_messages_with", None) if window else None
+            if callable(opener):
+                opener(name)
+            else:
+                self.ctx.publish("open-dm", name)
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.toast(f"Couldn't open messages: {exc}")
 
     # -- follow (user-triggered write) ------------------------------------- #
     def _sync_follow_button(self, busy: bool = False) -> None:
@@ -307,6 +521,7 @@ class BlogPage(Gtk.Box):
 
     def _finish_follow(self, name: str, target: bool, error: str, demo: bool) -> bool:
         self._follow_inflight = False
+        self._ask_dialog = None
         try:
             if self.get_root() is None:
                 return False

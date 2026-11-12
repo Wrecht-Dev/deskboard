@@ -52,6 +52,8 @@ class ComposerWindow(Adw.Window):
         self._publish_on: str | None = None
         self._discard_dialog = None
         self._blogs = self._collect_blogs()
+        self._submit_generation = 0
+        self._submit_caps: dict[str, bool] = {}
         self._mention_popover = None
         self._mention_timeout = 0
         self._mention_generation = 0
@@ -289,6 +291,11 @@ class ComposerWindow(Adw.Window):
         self.queue_button = Gtk.Button(label="Queue")
         self.queue_button.connect("clicked", lambda *_args: self._submit("queue"))
         bar.append(self.queue_button)
+        self.submit_button = Gtk.Button(label="Submit")
+        self.submit_button.set_tooltip_text("Submit this post to the blog for review")
+        self.submit_button.set_visible(False)
+        self.submit_button.connect("clicked", lambda *_args: self._submit("submission"))
+        bar.append(self.submit_button)
         self.publish_button = Gtk.Button(label="Publish")
         self.publish_button.add_css_class("suggested-action")
         self.publish_button.connect("clicked", lambda *_args: self._submit("published"))
@@ -297,6 +304,7 @@ class ComposerWindow(Adw.Window):
         self.set_content(toolbar)
 
         self._rebuild_attachments()
+        self._refresh_submit_capability()
 
     def _make_editor_page(self, placeholder_text: str, min_height: int = 220):
         text_view = Gtk.TextView()
@@ -448,6 +456,56 @@ class ComposerWindow(Adw.Window):
             self._window_title.set_subtitle(self._current_blog())
         except Exception:  # noqa: BLE001
             pass
+        self._refresh_submit_capability()
+
+    def _apply_submit_capability(self, visible: bool) -> None:
+        try:
+            self.submit_button.set_visible(bool(visible))
+            self.submit_button.set_sensitive(
+                bool(visible) and not self._busy and not self._demo
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_submit_capability(self) -> None:
+        self._submit_generation += 1
+        generation = self._submit_generation
+        blog = self._current_blog()
+        if not blog or self._demo:
+            self._apply_submit_capability(False)
+            return
+        if blog in self._submit_caps:
+            self._apply_submit_capability(self._submit_caps[blog])
+            return
+        getter = getattr(self.ctx.client, "get_blog_info", None)
+        if not callable(getter):
+            self._apply_submit_capability(False)
+            return
+        self._apply_submit_capability(False)
+
+        def work() -> None:
+            can = False
+            try:
+                info = getter(blog)
+                can = bool(getattr(info, "can_submit", False))
+            except Exception:  # noqa: BLE001 - capability is best-effort
+                can = False
+            try:
+                GLib.idle_add(self._finish_submit_capability, generation, blog, can)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="composer-capability").start()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _finish_submit_capability(self, generation: int, blog: str, can: bool) -> bool:
+        if generation != self._submit_generation or blog != self._current_blog():
+            return False
+        self._submit_caps[blog] = bool(can)
+        self._apply_submit_capability(bool(can))
+        return False
 
     @staticmethod
     def _buffer_text(view: Gtk.TextView) -> str:
@@ -493,6 +551,8 @@ class ComposerWindow(Adw.Window):
             enabled = not busy and not self._demo and bool(self._blogs)
             for button in (self.publish_button, self.queue_button, self.draft_button):
                 button.set_sensitive(enabled)
+            if self.submit_button.get_visible():
+                self.submit_button.set_sensitive(enabled)
             self.schedule_button.set_sensitive(not busy and not self._demo and bool(self._blogs))
             if self.attach_tray is not None:
                 self.attach_tray.set_sensitive(not busy and not self._demo and bool(self._blogs))
@@ -504,6 +564,8 @@ class ComposerWindow(Adw.Window):
         try:
             for button in (self.publish_button, self.queue_button, self.draft_button):
                 button.set_sensitive(can_write)
+            if self.submit_button.get_visible():
+                self.submit_button.set_sensitive(can_write)
             self.schedule_button.set_sensitive(can_write)
             if self.attach_tray is not None:
                 self.attach_tray.set_sensitive(can_write)
@@ -854,6 +916,7 @@ class ComposerWindow(Adw.Window):
             "published": "Scheduling…" if publish_on else "Publishing…",
             "queue": "Adding to queue…",
             "draft": "Saving draft…",
+            "submission": "Submitting…",
         }.get(state, "Posting…")
         self._set_busy(True, status)
         client = self.ctx.client
@@ -875,7 +938,7 @@ class ComposerWindow(Adw.Window):
                 error = _describe_error(exc)
             try:
                 GLib.idle_add(
-                    self._finish_submit, state, error, publish_on, result
+                    self._finish_submit, state, error, publish_on, result, blog
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -883,9 +946,9 @@ class ComposerWindow(Adw.Window):
         try:
             threading.Thread(target=work, daemon=True, name="composer-post").start()
         except Exception as exc:  # noqa: BLE001
-            self._finish_submit(state, _describe_error(exc), publish_on, None)
+            self._finish_submit(state, _describe_error(exc), publish_on, None, blog)
 
-    def _finish_submit(self, state: str, error: str, publish_on, result) -> bool:
+    def _finish_submit(self, state: str, error: str, publish_on, result, blog: str = "") -> bool:
         try:
             if not self.get_visible():
                 return False
@@ -899,6 +962,8 @@ class ComposerWindow(Adw.Window):
                 message = "Saved as draft"
             elif state == "queue":
                 message = "Added to queue"
+            elif state == "submission":
+                message = f"Submitted to @{blog or self._current_blog()} for review"
             elif publish_on:
                 message = f"Scheduled for {self.schedule_label.get_text()}"
             else:
