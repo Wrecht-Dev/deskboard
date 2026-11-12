@@ -899,7 +899,10 @@ class MainWindow(Adw.ApplicationWindow):
                 count = 0
             post.note_count = max(0, count + (1 if desired else -1))
             self.ctx.publish("post-changed", post)
-            self.toast("Liked" if desired else "Removed from likes")
+            if getattr(self.ctx, "demo", False):
+                self.toast("Demo mode: like state is not saved.")
+            else:
+                self.toast("Liked" if desired else "Removed from likes")
         except Exception:  # noqa: BLE001
             pass
         return False
@@ -909,6 +912,21 @@ class MainWindow(Adw.ApplicationWindow):
         if post is None:
             return
         self.open_reblog_dialog(post)
+
+    def _reblog_write(self, post, blog: str, comment: str, tags: str = "") -> None:
+        """Call the client's reblog endpoint, tolerating older demo clients."""
+        client = self.ctx.client
+        supports_tags = False
+        try:
+            import inspect
+
+            supports_tags = "tags" in inspect.signature(client.reblog).parameters
+        except Exception:  # noqa: BLE001
+            supports_tags = False
+        if supports_tags:
+            client.reblog(post, blog, comment, tags=tags)
+        else:
+            client.reblog(post, blog, comment)
 
     def open_reblog_dialog(self, post) -> None:
         if not self._can_write():
@@ -932,7 +950,7 @@ class MainWindow(Adw.ApplicationWindow):
             dialog.set_title("Reblog")
             try:
                 dialog.set_content_width(520)
-                dialog.set_content_height(400)
+                dialog.set_content_height(460)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -977,9 +995,17 @@ class MainWindow(Adw.ApplicationWindow):
             scroller = Gtk.ScrolledWindow()
             scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
             scroller.set_child(frame)
-            scroller.set_min_content_height(180)
+            scroller.set_min_content_height(160)
             scroller.set_vexpand(True)
             body.append(scroller)
+
+            tags_caption = Gtk.Label(label="Tags (comma separated)", xalign=0)
+            tags_caption.add_css_class("caption")
+            body.append(tags_caption)
+            tags_entry = Gtk.Entry()
+            tags_entry.set_placeholder_text("art, photography, design")
+            tags_entry.set_hexpand(True)
+            body.append(tags_entry)
             toolbar.set_content(body)
             dialog.set_child(toolbar)
 
@@ -990,6 +1016,10 @@ class MainWindow(Adw.ApplicationWindow):
                     ).strip()
                 except Exception:  # noqa: BLE001
                     comment = ""
+                try:
+                    tags = tags_entry.get_text().strip()
+                except Exception:  # noqa: BLE001
+                    tags = ""
                 reblog_button.set_sensitive(False)
                 cancel_button.set_sensitive(False)
                 reblog_button.set_label("Reblogging…")
@@ -1011,7 +1041,7 @@ class MainWindow(Adw.ApplicationWindow):
                 def work() -> None:
                     error = ""
                     try:
-                        self.ctx.client.reblog(post, blog, comment)
+                        self._reblog_write(post, blog, comment, tags)
                     except Exception as exc:  # noqa: BLE001
                         error = " ".join(str(exc).split()) or "Tumblr refused the request."
                     try:

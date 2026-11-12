@@ -1,7 +1,7 @@
 """Blog page: a blog's identity header over its post feed.
 
-Owner: shell.  Everything here is read-only; Follow is intentionally disabled
-until the write-auth phase lands.
+Owner: shell.  Follow is a user-triggered write on a worker thread; nothing
+here fires automatically.
 """
 from __future__ import annotations
 
@@ -19,9 +19,6 @@ from ..api.sources import FeedSource
 from ..util import short_number
 from .feed import FeedPage
 
-_FOLLOW_TOOLTIP = "needs the write-auth update"
-
-
 class BlogPage(Gtk.Box):
     __gtype_name__ = "DeskboardBlogPage"
 
@@ -33,6 +30,8 @@ class BlogPage(Gtk.Box):
         self._generation = 0
         self._blog = None
         self._open_url = ""
+        self._following = False
+        self._follow_inflight = False
 
         self.header = self._build_header()
         self.append(self.header)
@@ -103,10 +102,19 @@ class BlogPage(Gtk.Box):
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         actions.set_valign(Gtk.Align.START)
-        self.follow_button = Gtk.Button(label="Follow")
+        self.follow_button = Gtk.Button()
         self.follow_button.add_css_class("pill")
         self.follow_button.set_sensitive(False)
-        self.follow_button.set_tooltip_text(_FOLLOW_TOOLTIP)
+        follow_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        follow_box.set_halign(Gtk.Align.CENTER)
+        self.follow_spinner = Adw.Spinner()
+        self.follow_spinner.set_size_request(14, 14)
+        self.follow_spinner.set_visible(False)
+        follow_box.append(self.follow_spinner)
+        self.follow_label = Gtk.Label(label="Follow")
+        follow_box.append(self.follow_label)
+        self.follow_button.set_child(follow_box)
+        self.follow_button.connect("clicked", lambda *_args: self._on_follow_clicked())
         actions.append(self.follow_button)
 
         self.open_button = Gtk.Button.new_from_icon_name("web-browser-symbolic")
@@ -180,6 +188,7 @@ class BlogPage(Gtk.Box):
             if error or blog is None:
                 self.info_label.set_text(error or "Couldn't load blog details.")
                 self.info_row.set_visible(True)
+                self.follow_button.set_sensitive(bool(self.blog_name))
                 return False
             self._blog = blog
             name = str(getattr(blog, "name", "") or self.blog_name)
@@ -206,6 +215,9 @@ class BlogPage(Gtk.Box):
             if avatar_url:
                 self._load_avatar(avatar_url)
             self._open_url = str(getattr(blog, "web_url", "") or "")
+            self._following = bool(getattr(blog, "is_following", False))
+            self.follow_button.set_sensitive(True)
+            self._sync_follow_button()
             self.info_row.set_visible(False)
             # Keep the window title in sync once the real blog title is known.
             window = getattr(self.ctx, "window", None)
@@ -234,6 +246,91 @@ class BlogPage(Gtk.Box):
             self.ctx.images.load(url, 128, 128, apply)
         except Exception:  # noqa: BLE001
             pass
+
+    # -- follow (user-triggered write) ------------------------------------- #
+    def _sync_follow_button(self, busy: bool = False) -> None:
+        try:
+            self.follow_label.set_text("Following" if self._following else "Follow")
+            self.follow_spinner.set_visible(bool(busy))
+            self.follow_button.set_sensitive(not busy and not self._follow_inflight)
+            if self._following:
+                self.follow_button.remove_css_class("suggested-action")
+            else:
+                self.follow_button.add_css_class("suggested-action")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_follow_clicked(self) -> None:
+        if self._follow_inflight:
+            return
+        name = ""
+        try:
+            name = str(getattr(self._blog, "name", "") or self.blog_name)
+        except Exception:  # noqa: BLE001
+            name = self.blog_name
+        if not name:
+            self.ctx.toast("This blog cannot be followed right now.")
+            return
+        demo = bool(getattr(self.ctx, "demo", False))
+        try:
+            signed_in = demo or bool(self.ctx.is_signed_in)
+        except Exception:  # noqa: BLE001
+            signed_in = demo
+        if not signed_in:
+            self.ctx.toast("Sign in to follow blogs.")
+            return
+
+        target = not self._following
+        self._following = target
+        self._follow_inflight = True
+        self._sync_follow_button(busy=True)
+        client = self.ctx.client
+
+        def work() -> None:
+            error = ""
+            try:
+                if target:
+                    client.follow(name)
+                else:
+                    client.unfollow(name)
+            except Exception as exc:  # noqa: BLE001 - surface to the user
+                error = " ".join(str(exc).split()) or "Tumblr refused the request."
+            try:
+                GLib.idle_add(self._finish_follow, name, target, error, demo)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="blog-follow").start()
+        except Exception as exc:  # noqa: BLE001
+            self._finish_follow(name, target, str(exc), demo)
+
+    def _finish_follow(self, name: str, target: bool, error: str, demo: bool) -> bool:
+        self._follow_inflight = False
+        try:
+            if self.get_root() is None:
+                return False
+            if error:
+                self._following = not target
+                self._sync_follow_button()
+                action = "follow" if target else "unfollow"
+                self.ctx.toast(f"Couldn't {action} @{name}: {error}")
+                return False
+            try:
+                if self._blog is not None:
+                    self._blog.is_following = target
+            except Exception:  # noqa: BLE001
+                pass
+            self._sync_follow_button()
+            if demo:
+                self.ctx.toast("Demo mode: follow state is not saved.")
+            elif target:
+                self.ctx.toast(f"Following @{name}")
+            else:
+                self.ctx.toast(f"Unfollowed @{name}")
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     def _open_in_browser(self) -> None:
         url = self._open_url or (

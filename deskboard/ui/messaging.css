@@ -49,10 +49,12 @@
   background-color: alpha(@window_fg_color, 0.055);
 }
 
+/* A click opens the conversation, so a persistent selection paint only adds
+ * noise (same choice as the feed list). */
 .db-msg-list row:selected,
 .db-msg-list row:selected:hover,
 .db-msg-list row:selected:focus {
-  background-color: alpha(@accent_bg_color, 0.12);
+  background-color: transparent;
   outline: none;
   box-shadow: none;
 }
@@ -235,4 +237,36 @@
   border: 1px solid alpha(@window_fg_color, 0.12);
   border-radius: 999px;
   padding: 5px 13px;
+}
+
+/* -------------------------------------------------- sending / write states */
+.db-msg-composer-scroll {
+  background-color: alpha(@window_fg_color, 0.04);
+  border: 1px solid alpha(@window_fg_color, 0.12);
+  border-radius: 12px;
+}
+
+.db-msg-composer-scroll textview {
+  background: transparent;
+  color: @window_fg_color;
+}
+
+.db-msg-senderror {
+  color: @error_color;
+  font-weight: 600;
+}
+
+/* The optimistic bubble is dimmed until Tumblr confirms the send. */
+.db-msg-pending {
+  opacity: 0.6;
+}
+
+.db-msg-pending .db-msg-time {
+  opacity: 0.85;
+}
+
+.db-msg-accept {
+  min-height: 26px;
+  padding: 2px 12px;
+  font-size: 0.86em;
 }

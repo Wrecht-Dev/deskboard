@@ -41,12 +41,12 @@ deliberately **not** exercised (they mutate the account).
 | Action | Endpoint | Status |
 |---|---|---|
 | Like / unlike | `POST /v2/user/like`, `/v2/user/unlike` | ✅ verified live (single test, restored) |
-| Reblog (with comment/tags) | `POST /v2/blog/{blog}/post/reblog` | 🟡 auth verified; UI wiring pending |
-| Follow / unfollow | `POST /v2/user/follow`, `/v2/user/unfollow` | 🟡 auth verified; UI wiring pending |
-| Reply to a post | `POST /v2/user/post/reply` | 🟡 payload known; UI pending |
+| Reblog (with comment/tags) | `POST /v2/blog/{blog}/post/reblog` | ✅ UI wired (dialog + tags); mocked-path verified |
+| Follow / unfollow | `POST /v2/user/follow`, `/v2/user/unfollow` | ✅ blog header button; revert on error |
+| Reply to a post | `POST /v2/user/post/reply` | ✅ post-detail composer; optimistic prepend |
 | Send ask / submit | ✗ not found at guessed paths | ❗ needs RE |
 | Block / mute | ✗ not found at guessed paths | ❗ needs RE |
-| DM send / accept / read | `POST /v2/conversations/messages`, `/accept`, `/mark_as_read` | 🟡 client ready; UI pending |
+| DM send / accept / read | `POST /v2/conversations/messages`, `/accept`, `/mark_as_read` | ✅ composer, accept, auto mark-read |
 
 **Write auth: solved.** Reads accept `Authorization: Bearer <public web token>`
 + session cookies. Writes additionally require the per-session **`X-CSRF`**

@@ -529,6 +529,32 @@ class TumblrClient:
         response = data.get("response", {})
         return response if isinstance(response, dict) else {}
 
+    # -- composer ---------------------------------------------------------- #
+    POST_STATES = ("published", "draft", "queue", "submission")
+
+    def create_post(self, blog: str, content: list[dict], state: str = "published",
+                    tags: str | list[str] | None = None, layout: list[dict] | None = None,
+                    publish_on: str | None = None) -> dict:
+        """Create a post from NPF content blocks.
+
+        Mirrors the web composer: ``POST /v2/blog/{blog}/posts`` with
+        ``content`` (NPF blocks), ``layout``, comma-joined ``tags`` and a
+        ``state`` of published/draft/queue/submission.
+        """
+        if state not in self.POST_STATES:
+            raise ValueError(f"unknown post state: {state}")
+        body: dict[str, Any] = {
+            "content": json.dumps(content, separators=(",", ":")),
+            "state": state,
+            "layout": json.dumps(layout or [{"type": "rows"}], separators=(",", ":")),
+        }
+        if tags:
+            body["tags"] = ",".join(tags) if isinstance(tags, (list, tuple)) else str(tags)
+        if publish_on:
+            body["publish_on"] = publish_on
+        data = self.request(f"/v2/blog/{urllib.parse.quote(blog)}/posts", method="POST", body=body)
+        return data.get("response", {}) if isinstance(data, dict) else {}
+
     # -- media upload (composer) ------------------------------------------- #
     def upload_image(self, path: str) -> dict:
         """Upload a local image through ``POST /v2/media/image`` (multipart)."""

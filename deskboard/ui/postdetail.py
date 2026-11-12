@@ -13,6 +13,7 @@ Layout::
     │  ┌────────────────────────────────────────────────────┐  │
     │  │ PostCard(post)                                     │  │
     │  └────────────────────────────────────────────────────┘  │
+    │  [ Write a reply…                            ] [Reply]   │
     │  🔗 https://….tumblr.com/post/…        [Open] [Copy]    │
     └──────────────────────────────────────────────────────────┘
 
@@ -23,6 +24,7 @@ rendered card and no extra API call.
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -365,6 +367,35 @@ class NotesList(Gtk.Box):
         self._footer_error = ""
         self._sync_footer()
         self._request_page(self._next_url)
+
+    @property
+    def loaded(self) -> bool:
+        """True once a first page has landed (may be an empty page)."""
+        return self._started
+
+    @property
+    def busy(self) -> bool:
+        return self._loading
+
+    def prepend_note(self, note: dict[str, Any]) -> bool:
+        """Put a freshly posted reply at the top of an already-loaded list."""
+        if self._destroyed or not isinstance(note, dict):
+            return False
+        try:
+            key = note_key(note)
+            if key in self._seen:
+                return False
+            self._seen.add(key)
+            self.store.insert(0, NoteItem(note))
+            if self._total is not None:
+                self._total = int(self._total) + 1
+            self._started = True
+            self._show_state("content")
+            self._update_header()
+            self._sync_footer()
+            return True
+        except Exception:  # noqa: BLE001 - a failed prepend must not break the page
+            return False
 
     def cleanup(self) -> None:
         """Invalidate any in-flight worker; called when the page is replaced."""
@@ -717,6 +748,18 @@ class PostDetailPage(Gtk.Box):
         self.on_back = on_back
         self.add_css_class("db-detail-page")
 
+        # Reply composer state (built with the post view below).
+        self._destroyed = False
+        self._replying = False
+        self._reply_token = 0
+        self._reply_active = False
+        self._reply_entry: Gtk.Entry | None = None
+        self._reply_button: Gtk.Button | None = None
+        self._reply_button_label: Gtk.Label | None = None
+        self._reply_spinner: Adw.Spinner | None = None
+        self._reply_error: Gtk.Label | None = None
+        self._reply_hint: Gtk.Label | None = None
+
         self._stack = Adw.ViewStack()
         self._stack.set_vexpand(True)
         post_page = self._stack.add_titled(self._build_post_page(), "post", "Post")
@@ -782,6 +825,8 @@ class PostDetailPage(Gtk.Box):
             pass
 
     def cleanup(self) -> None:
+        self._reply_token += 1
+        self._replying = False
         try:
             self.notes.cleanup()
         except Exception:  # noqa: BLE001
@@ -854,6 +899,10 @@ class PostDetailPage(Gtk.Box):
         self._card = card
         body.append(card)
 
+        reply_row = self._build_reply_row()
+        if reply_row is not None:
+            body.append(reply_row)
+
         url = _post_url(self.post)
         if url:
             body.append(self._build_permalink_row(url))
@@ -870,6 +919,229 @@ class PostDetailPage(Gtk.Box):
         scroller.set_vexpand(True)
         scroller.set_hexpand(True)
         return scroller
+
+    # -- reply composer ----------------------------------------------------- #
+    def _build_reply_row(self) -> Gtk.Widget | None:
+        """A compact reply entry, shown only when replying makes sense.
+
+        Signed-out pages hide it entirely; demo builds a disabled version with
+        an explicit label, because ``DemoClient`` must never pretend a write
+        succeeded.
+        """
+        demo = bool(getattr(self.ctx, "demo", False))
+        try:
+            signed_in = bool(self.ctx.is_signed_in)
+        except Exception:  # noqa: BLE001
+            signed_in = False
+        can_reply = bool(getattr(self.post, "can_reply", True))
+        if not demo and not (signed_in and can_reply):
+            return None
+        # In demo the row stays visible but disabled so the limitation is
+        # obvious instead of looking like a missing feature.
+        self._reply_active = bool(signed_in and can_reply and not demo)
+
+        outer = _box(spacing=4)
+        outer.add_css_class("db-detail-reply")
+        outer.set_margin_start(18)
+        outer.set_margin_end(18)
+        outer.set_margin_top(2)
+        outer.set_margin_bottom(2)
+
+        row = _box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.add_css_class("db-detail-reply-row")
+
+        entry = Gtk.Entry()
+        entry.add_css_class("db-detail-reply-entry")
+        entry.set_hexpand(True)
+        if demo:
+            entry.set_placeholder_text("Replies are disabled in demo mode")
+            entry.set_tooltip_text("Demo mode: replies are disabled")
+        else:
+            entry.set_placeholder_text("Write a reply…")
+            entry.set_tooltip_text("Reply publicly from your blog")
+        entry.set_sensitive(self._reply_active)
+        entry.connect("activate", lambda *_args: self._send_reply())
+        self._reply_entry = entry
+        row.append(entry)
+
+        button = Gtk.Button()
+        button.add_css_class("db-detail-reply-button")
+        button.set_tooltip_text(
+            "Demo mode: replies are disabled" if demo else "Post this reply"
+        )
+        button.set_sensitive(self._reply_active)
+        button.connect("clicked", lambda *_args: self._send_reply())
+        content = _box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        spinner = Adw.Spinner()
+        spinner.set_size_request(14, 14)
+        spinner.set_visible(False)
+        label = Gtk.Label(label="Reply")
+        content.append(spinner)
+        content.append(label)
+        button.set_child(content)
+        self._reply_button = button
+        self._reply_spinner = spinner
+        self._reply_button_label = label
+        row.append(button)
+        outer.append(row)
+
+        hint = Gtk.Label()
+        hint.set_wrap(True)
+        hint.set_xalign(0.0)
+        _dim(hint)
+        hint.add_css_class("db-detail-reply-hint")
+        if demo:
+            hint.set_text("Demo mode — replies are disabled.")
+            hint.set_visible(True)
+        else:
+            hint.set_visible(False)
+            blog = self._reply_blog()
+            if not blog:
+                hint.set_text("Your blog is still loading — reply in a moment.")
+                hint.set_visible(True)
+        self._reply_hint = hint
+        outer.append(hint)
+
+        error = Gtk.Label()
+        error.set_wrap(True)
+        error.set_xalign(0.0)
+        error.add_css_class("caption")
+        error.add_css_class("db-detail-reply-error")
+        error.set_visible(False)
+        self._reply_error = error
+        outer.append(error)
+        return outer
+
+    def _reply_blog(self) -> str:
+        blog = str(getattr(self.ctx, "user_blog", "") or "").strip()
+        if not blog:
+            blogs = getattr(self.ctx, "user_blogs", None) or []
+            if blogs:
+                blog = str(blogs[0] or "").strip()
+        return blog
+
+    def _send_reply(self) -> None:
+        if self._replying or not self._reply_active:
+            return
+        entry = self._reply_entry
+        if entry is None:
+            return
+        text = entry.get_text().strip()
+        if not text:
+            try:
+                entry.grab_focus()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        blog = self._reply_blog()
+        if not blog:
+            self._show_reply_error("Your account has no blog to reply from yet.")
+            return
+
+        self._clear_reply_error()
+        self._reply_token += 1
+        token = self._reply_token
+        self._set_reply_busy(True)
+        client = self.ctx.client
+        post = self.post
+
+        def work() -> None:
+            error = ""
+            try:
+                client.reply(post, blog, text)
+            except Exception as exc:  # noqa: BLE001 - shown inline, never swallowed
+                error = describe_error(exc)
+            try:
+                GLib.idle_add(self._finish_reply, token, text, blog, error)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="post-reply").start()
+        except Exception as exc:  # noqa: BLE001 - e.g. resource exhaustion
+            self._finish_reply(token, text, blog, describe_error(exc))
+
+    def _finish_reply(self, token: int, text: str, blog: str, error: str) -> bool:
+        try:
+            if token != self._reply_token or self._destroyed:
+                return False
+            self._set_reply_busy(False)
+            if error:
+                self._show_reply_error(error)
+                return False  # keep the text so it can be retried
+            if self._reply_entry is not None:
+                self._reply_entry.set_text("")
+            self._clear_reply_error()
+            try:
+                self.post.note_count = int(getattr(self.post, "note_count", 0) or 0) + 1
+                self.post.reply_count = int(getattr(self.post, "reply_count", 0) or 0) + 1
+            except Exception:  # noqa: BLE001
+                pass
+            note = self._reply_note(text, blog)
+            try:
+                if self.notes.loaded:
+                    self.notes.prepend_note(note)
+                elif self.notes.busy:
+                    # A first load was in flight before the reply landed; fetch
+                    # it again so the new note cannot be missed.
+                    self.notes.refresh()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.ctx.toast("Reply posted")
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        except Exception:  # noqa: BLE001 - never break the page from a worker result
+            return False
+
+    def _reply_note(self, text: str, blog: str) -> dict[str, Any]:
+        """A local note dict so an already-loaded list shows the reply at once."""
+        return {
+            "type": "reply",
+            "blogName": blog,
+            "blogUrl": f"https://{blog}.tumblr.com/",
+            "avatarUrl": "",
+            "timestamp": int(time.time()),
+            "replyText": text,
+            "formatting": [],
+            "followed": False,
+        }
+
+    def _set_reply_busy(self, busy: bool) -> None:
+        self._replying = bool(busy)
+        enabled = self._reply_active and not busy
+        try:
+            if self._reply_spinner is not None:
+                self._reply_spinner.set_visible(bool(busy))
+            if self._reply_button_label is not None:
+                self._reply_button_label.set_text("Replying…" if busy else "Reply")
+            if self._reply_button is not None:
+                self._reply_button.set_sensitive(enabled)
+            if self._reply_entry is not None:
+                self._reply_entry.set_sensitive(enabled)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _show_reply_error(self, message: str) -> None:
+        try:
+            if self._reply_error is not None:
+                self._reply_error.set_text(message)
+                self._reply_error.set_visible(True)
+            if self._reply_hint is not None:
+                self._reply_hint.set_visible(False)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _clear_reply_error(self) -> None:
+        try:
+            if self._reply_error is not None:
+                self._reply_error.set_text("")
+                self._reply_error.set_visible(False)
+            if self._reply_hint is not None and bool(getattr(self.ctx, "demo", False)):
+                self._reply_hint.set_visible(True)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _build_permalink_row(self, url: str) -> Gtk.Widget:
         row = _box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -991,4 +1263,5 @@ class PostDetailPage(Gtk.Box):
         return False
 
     def _on_destroy(self, *_args: Any) -> None:
+        self._destroyed = True
         self.cleanup()

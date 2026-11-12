@@ -39,6 +39,43 @@
   border-radius: 999px;
 }
 
+/* --------------------------------------------------------- reply composer */
+
+.db-detail-reply {
+  margin-top: 2px;
+}
+
+.db-detail-reply-entry {
+  min-height: 34px;
+  border-radius: 10px;
+}
+
+.db-detail-reply-button {
+  min-height: 32px;
+  padding: 0 16px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+.db-detail-reply-button:disabled {
+  opacity: 0.55;
+}
+
+.db-detail-reply-entry:disabled {
+  opacity: 0.75;
+}
+
+.db-detail-reply-hint {
+  font-size: 0.85em;
+  opacity: 0.65;
+  margin-left: 2px;
+}
+
+.db-detail-reply-error {
+  color: @error_color;
+  margin-left: 2px;
+}
+
 /* ------------------------------------------------------------------- notes */
 
 .db-detail-notes {

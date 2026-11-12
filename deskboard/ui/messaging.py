@@ -6,8 +6,12 @@ This module is deliberately defensive about Tumblr's DM payloads: the web API
 hands back nested objects whose key casing has drifted over the years
 (``participants``/``messages`` are camelCase today, but ``participant`` may be a
 name string or an object, media may be a list of dictionaries or a single URL).
-Nothing here assumes a single privileged shape, and nothing here writes: DMs
-are read-only in this phase, so the composer is intentionally inert.
+Nothing here assumes a single privileged shape.
+
+Writes (sending a message, marking a thread read, accepting a request) run on
+worker threads exactly like reads.  The offline demo client implements none of
+them, so ``--demo`` stays inert; only a user-visible action can surface an
+inline error (a failed read receipt is swallowed).
 
 Threading follows the house rule: every network call runs on a worker thread and
 its result is dropped unless the generation it was started for is still current.
@@ -17,6 +21,7 @@ between issuing a request and receiving the answer.
 from __future__ import annotations
 
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -600,6 +605,45 @@ def _conversation_unread_text(conversation: Any) -> str:
     return "99+" if count > 99 else str(count)
 
 
+def _conversation_pending(conversation: Any) -> bool:
+    if not isinstance(conversation, dict):
+        return False
+    for key in ("pending", "isPending", "is_pending"):
+        if key in conversation:
+            return as_bool(conversation.get(key))
+    return False
+
+
+def _conversation_can_send(conversation: Any) -> bool:
+    """``canSend == False`` means the thread is read-only (blocked/deleted)."""
+    if not isinstance(conversation, dict):
+        return False
+    for key in ("canSend", "can_send"):
+        if key in conversation:
+            return as_bool(conversation.get(key))
+    status = _first_str(conversation, "status").casefold()
+    return status not in ("deleted", "blocked", "inactive", "closed")
+
+
+def _conversation_recipients(conversation: Any, ctx: Any = None) -> list[str]:
+    """Blog names to address a DM to: everyone on the other side, in order."""
+    names: list[str] = []
+    for person in _conversation_people(conversation, ctx):
+        name = _person_blog(person) or _person_display(person)
+        if name and name not in names:
+            names.append(name)
+    if not names and isinstance(conversation, dict):
+        fallback = _first_str(conversation, "participant", "blogName", "blog_name")
+        if fallback:
+            names.append(fallback)
+    return names
+
+
+def _conversation_recipient(conversation: Any, ctx: Any = None) -> str:
+    names = _conversation_recipients(conversation, ctx)
+    return names[0] if names else ""
+
+
 # --------------------------------------------------------------------------- #
 # tiny widget helpers
 # --------------------------------------------------------------------------- #
@@ -865,6 +909,79 @@ class _ConversationTab(Gtk.Box):
                 pass
             self._vadj_handler = 0
 
+    def add_conversation(self, conversation: dict, at: int = 0) -> bool:
+        """Insert (or move in) one conversation without a network round-trip."""
+        if self._destroyed or not isinstance(conversation, dict):
+            return False
+        key = _conversation_id(conversation) or f"object:{id(conversation)}"
+        if key in self._added:
+            return False
+        try:
+            position = max(0, min(int(at or 0), self.store.get_n_items()))
+            self.store.insert(position, _ConversationItem(conversation))
+        except Exception:  # noqa: BLE001
+            return False
+        self._added.add(key)
+        if self._loaded:
+            try:
+                self._show_state("content")
+                self._sync_footer()
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
+    def remove_conversation(self, conversation: dict) -> int | None:
+        """Remove one conversation, returning its old row index when found."""
+        if not isinstance(conversation, dict):
+            return None
+        wanted = _conversation_id(conversation)
+        try:
+            for index in range(self.store.get_n_items()):
+                item = self.store.get_item(index)
+                data = getattr(item, "conversation", None)
+                if not isinstance(data, dict):
+                    continue
+                if data is conversation:
+                    matches = True
+                else:
+                    other = _conversation_id(data)
+                    matches = bool(wanted and other and wanted == other)
+                if not matches:
+                    continue
+                self.store.remove(index)  # GListStore takes a position, not an item
+                self._added.discard(wanted or f"object:{id(conversation)}")
+                if self._loaded and self.store.get_n_items() == 0:
+                    self._show_state("empty")
+                self._sync_footer()
+                return index
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def refresh_conversation(self, conversation: dict) -> bool:
+        """Rebuild one row after its dict was mutated (e.g. a read receipt)."""
+        if self._destroyed or not isinstance(conversation, dict):
+            return False
+        wanted = _conversation_id(conversation)
+        try:
+            for index in range(self.store.get_n_items()):
+                data = getattr(self.store.get_item(index), "conversation", None)
+                if not isinstance(data, dict):
+                    continue
+                matches = data is conversation
+                if not matches:
+                    other = _conversation_id(data)
+                    matches = bool(wanted and other and wanted == other)
+                if matches:
+                    # Replacing the item (not items_changed) is what makes
+                    # Gtk.ListView rebind the row.
+                    self.store.remove(index)
+                    self.store.insert(index, _ConversationItem(conversation))
+                    return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
     # -- construction ------------------------------------------------------ #
     def _build_loading_page(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
@@ -970,9 +1087,12 @@ class _ConversationTab(Gtk.Box):
             pass
 
     def _build_row(self, conversation: dict) -> Gtk.Widget:
+        spam = _conversation_spam(conversation)
+        pending = _conversation_pending(conversation)
+        can_accept = self.requests and (pending or spam)
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.add_css_class("db-msg-row")
-        if _conversation_spam(conversation):
+        if spam:
             outer.add_css_class("db-msg-spam")
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -995,8 +1115,11 @@ class _ConversationTab(Gtk.Box):
         title.set_ellipsize(Pango.EllipsizeMode.END)
         title.set_max_width_chars(60)
         name_row.append(title)
-        if _conversation_spam(conversation):
-            chip = _label("Message request", css=("caption", "db-msg-chip"))
+        if spam or pending:
+            chip = _label(
+                "Message request" if spam else "Request",
+                css=("caption", "db-msg-chip"),
+            )
             chip.set_valign(Gtk.Align.CENTER)
             name_row.append(chip)
         filler = Gtk.Box()
@@ -1036,14 +1159,49 @@ class _ConversationTab(Gtk.Box):
             )
             side.append(badge)
 
-        if _conversation_spam(conversation):
-            hint = _label(
-                "Message request — hidden until you reply",
-                css=("caption", "dim-label", "db-msg-spam-hint"),
-            )
-            hint.set_ellipsize(Pango.EllipsizeMode.END)
-            text.append(hint)
+        hint_text = ""
+        if spam and (pending or self.requests):
+            hint_text = "Message request — hidden until you reply"
+        elif pending:
+            hint_text = "Waiting for you to accept"
+        if hint_text or can_accept:
+            footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            footer.set_margin_top(2)
+            if hint_text:
+                hint = _label(
+                    hint_text,
+                    css=(
+                        ("caption", "dim-label", "db-msg-spam-hint")
+                        if spam
+                        else ("caption", "dim-label")
+                    ),
+                )
+                hint.set_ellipsize(Pango.EllipsizeMode.END)
+                hint.set_hexpand(True)
+                footer.append(hint)
+            if can_accept:
+                accept = Gtk.Button(label="Accept")
+                accept.add_css_class("pill")
+                accept.add_css_class("suggested-action")
+                accept.add_css_class("db-msg-accept")
+                accept.set_valign(Gtk.Align.CENTER)
+                try:
+                    accept.set_sensitive(not self.owner.is_accepting(conversation))
+                except Exception:  # noqa: BLE001
+                    pass
+                accept.connect(
+                    "clicked",
+                    lambda _button, conv=conversation: self._on_accept_clicked(conv),
+                )
+                footer.append(accept)
+            text.append(footer)
         return outer
+
+    def _on_accept_clicked(self, conversation: dict) -> None:
+        try:
+            self.owner.accept_conversation(conversation)
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- loading ----------------------------------------------------------- #
     def _request(self, cursor: str | None) -> bool:
@@ -1369,7 +1527,7 @@ class _MessageItem(GObject.Object):
 
 
 class ConversationPage(Gtk.Box):
-    """One conversation thread: bubbles, an inert composer, older-page scroll."""
+    """One conversation thread: bubbles, an optimistic composer, older pages."""
 
     __gtype_name__ = "DeskboardConversationPage"
 
@@ -1397,6 +1555,16 @@ class ConversationPage(Gtk.Box):
         self._conversation_id = _conversation_id(self.conversation)
         self._people = _conversation_people(self.conversation, ctx)
         self._group = len(self._people) > 1
+        self._recipients = _conversation_recipients(self.conversation, ctx)
+        self._recipient = self._recipients[0] if self._recipients else ""
+        self._can_send = _conversation_can_send(self.conversation)
+
+        # composer / write state
+        self._send_inflight = False
+        self._pending_item: _MessageItem | None = None
+        self._pending_message: dict | None = None
+        self._read_id = 0
+        self.on_read = None
 
         self.store = Gio.ListStore(item_type=_MessageItem)
         self.selection = Gtk.NoSelection(model=self.store)
@@ -1454,6 +1622,9 @@ class ConversationPage(Gtk.Box):
             pass
 
         self._auto_load_id = GLib.idle_add(self._auto_load)
+        # Opening a thread acknowledges its unread messages.  Fire-and-forget:
+        # a failed receipt must never interrupt the conversation.
+        self._read_id = GLib.idle_add(self._mark_read_once)
 
     # -- public API -------------------------------------------------------- #
     def refresh(self) -> None:
@@ -1587,33 +1758,308 @@ class ConversationPage(Gtk.Box):
         return revealer
 
     def _build_composer(self) -> Gtk.Widget:
-        composer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        composer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         composer.add_css_class("db-msg-composer")
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         composer.append(row)
 
-        self.entry = Gtk.Entry()
-        self.entry.set_placeholder_text("Write a message")
-        self.entry.set_hexpand(True)
-        self.entry.set_sensitive(False)
-        self.entry.set_tooltip_text("Sending needs the next update")
-        row.append(self.entry)
+        # Multi-line on purpose: Enter sends, Shift+Enter adds a line.
+        self.text_view = Gtk.TextView()
+        self.text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.text_view.set_accepts_tab(False)
+        self.text_view.set_top_margin(7)
+        self.text_view.set_bottom_margin(7)
+        self.text_view.set_left_margin(9)
+        self.text_view.set_right_margin(9)
+        self.buffer = self.text_view.get_buffer()
+        self.buffer.connect("changed", self._on_composer_changed)
+
+        self.composer_scroll = Gtk.ScrolledWindow()
+        self.composer_scroll.add_css_class("db-msg-composer-scroll")
+        self.composer_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.composer_scroll.set_propagate_natural_height(True)
+        self.composer_scroll.set_max_content_height(132)
+        self.composer_scroll.set_min_content_height(42)
+        self.composer_scroll.set_hexpand(True)
+        self.composer_scroll.set_child(self.text_view)
+        row.append(self.composer_scroll)
 
         self.send_button = Gtk.Button(label="Send")
         self.send_button.add_css_class("pill")
         self.send_button.add_css_class("suggested-action")
-        self.send_button.set_sensitive(False)
-        self.send_button.set_tooltip_text("Sending needs the next update")
         self.send_button.set_valign(Gtk.Align.CENTER)
+        self.send_button.connect("clicked", lambda *_args: self._send())
         row.append(self.send_button)
 
-        hint = _label(
-            "Sending needs the next update", css=("caption", "dim-label", "db-msg-sendhint")
-        )
-        composer.append(hint)
-        composer.set_tooltip_text("Sending needs the next update")
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self._on_composer_key)
+        self.text_view.add_controller(key_controller)
+
+        self.send_error = _label("", css=("caption", "db-msg-senderror"))
+        self.send_error.set_wrap(True)
+        self.send_error.set_visible(False)
+        composer.append(self.send_error)
+
+        self.composer_hint = _label("", css=("caption", "dim-label", "db-msg-sendhint"))
+        self.composer_hint.set_wrap(True)
+        composer.append(self.composer_hint)
+
+        self._update_composer()
         return composer
+
+    # -- composer state ---------------------------------------------------- #
+    def _composer_reason(self) -> str:
+        """Why the composer is unavailable, or ``""`` when it can send."""
+        client = getattr(self.ctx, "client", None)
+        sender = getattr(client, "send_message", None)
+        demo = bool(getattr(self.ctx, "demo", False))
+        if not callable(sender):
+            if demo:
+                return "Sending isn't available in the offline demo."
+            return "Sending isn't available with this Tumblr client."
+        if not self._conversation_id:
+            return "This conversation can't be messaged."
+        if not self._recipient:
+            return "Can't reply in this conversation."
+        if not self._can_send:
+            return "This conversation is read-only."
+        return ""
+
+    def _buffer_text(self) -> str:
+        try:
+            start, end = self.buffer.get_bounds()
+            return self.buffer.get_text(start, end, True)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _set_buffer_text(self, text: str) -> None:
+        try:
+            self.buffer.set_text(text or "")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _update_composer(self) -> None:
+        try:
+            reason = self._composer_reason()
+            has_text = bool(self._buffer_text().strip())
+            sending = self._send_inflight
+            self.text_view.set_sensitive(not reason)
+            self.send_button.set_sensitive(not reason and not sending and has_text)
+            if sending:
+                hint = "Sending…"
+            elif reason:
+                hint = reason
+            else:
+                hint = ""
+            self.composer_hint.set_text(hint)
+            self.composer_hint.set_visible(bool(hint))
+            if reason:
+                self.text_view.set_tooltip_text(reason)
+                self.send_button.set_tooltip_text(reason)
+            elif sending:
+                self.text_view.set_tooltip_text("Sending your message…")
+                self.send_button.set_tooltip_text("Sending…")
+            else:
+                self.text_view.set_tooltip_text("Enter sends, Shift+Enter adds a line")
+                self.send_button.set_tooltip_text("Send message")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_composer_changed(self, *_args) -> None:
+        try:
+            self._hide_send_error()
+        except Exception:  # noqa: BLE001
+            pass
+        self._update_composer()
+
+    def _on_composer_key(self, _controller, keyval, _keycode, state) -> bool:
+        try:
+            if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                if state & Gdk.ModifierType.SHIFT_MASK:
+                    return False  # let the view insert a newline
+                self._send()
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    def _show_send_error(self, message: str) -> None:
+        try:
+            text = _collapse(message, 280) or "Tumblr refused the message."
+            self.send_error.set_text(f"Couldn't send: {text}")
+            self.send_error.set_visible(True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _hide_send_error(self) -> None:
+        try:
+            self.send_error.set_visible(False)
+            self.send_error.set_text("")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # -- sending ----------------------------------------------------------- #
+    def _send(self) -> None:
+        """Optimistically append a bubble, then POST the message off-thread."""
+        if self._send_inflight or self._destroyed:
+            return
+        reason = self._composer_reason()
+        if reason:
+            self._update_composer()
+            return
+        text = self._buffer_text().strip()
+        if not text:
+            return
+        client = getattr(self.ctx, "client", None)
+        sender = getattr(client, "send_message", None)
+        if not callable(sender):
+            self._update_composer()
+            return
+
+        conversation_id = self._conversation_id
+        participant = self._recipient
+        participants = list(self._recipients)
+        self._send_inflight = True
+        self._hide_send_error()
+
+        message = {
+            "id": f"local-{time.time_ns()}",
+            "participant": (
+                str(getattr(self.ctx, "user_name", "") or getattr(self.ctx, "user_blog", ""))
+                or "me"
+            ),
+            "content": text,
+            "type": "TEXT",
+            "timestamp": int(time.time()),
+            "isCurrentUser": True,
+            "_pending": True,
+            "_local": True,
+        }
+        item = _MessageItem(message)
+        self._pending_item = item
+        self._pending_message = message
+        try:
+            self.store.append(item)
+            self._show_state("content")
+            self._schedule_scroll_bottom()
+        except Exception:  # noqa: BLE001
+            self._pending_item = None
+            self._pending_message = None
+            self._send_inflight = False
+            self._show_send_error("The message could not be displayed.")
+            self._update_composer()
+            return
+        self._update_composer()
+
+        def work() -> None:
+            error = ""
+            try:
+                sender(conversation_id, participant, text, participants=participants)
+            except Exception as exc:  # noqa: BLE001 - report on the main loop
+                error = describe_error(exc)
+            try:
+                GLib.idle_add(self._finish_send, item, message, text, error)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="msg-send").start()
+        except Exception as exc:  # noqa: BLE001 - e.g. thread limits
+            self._finish_send(item, message, text, describe_error(exc))
+
+    def _position_of(self, item: GObject.Object) -> int:
+        try:
+            for index in range(self.store.get_n_items()):
+                if self.store.get_item(index) is item:
+                    return index
+        except Exception:  # noqa: BLE001
+            return -1
+        return -1
+
+    def _finish_send(self, item, message: dict, sent_text: str, error: str) -> bool:
+        self._send_inflight = False
+        try:
+            if self._destroyed:
+                return False
+            position = self._position_of(item)
+            if error:
+                if position >= 0:
+                    try:
+                        self.store.remove(position)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if self.store.get_n_items() == 0:
+                    self._show_state("empty")
+                self._pending_item = None
+                self._pending_message = None
+                self._show_send_error(error)
+                # The typed text was never removed; restore it only if the
+                # user cleared the box while the request was running.
+                if not self._buffer_text().strip():
+                    self._set_buffer_text(sent_text)
+                self._update_composer()
+                return False
+
+            message.pop("_pending", None)
+            message.pop("_local", None)
+            if position >= 0:
+                try:
+                    # Replace the row so the dimmed "sending" bubble becomes a
+                    # normal sent bubble without touching the network state.
+                    self.store.remove(position)
+                    self.store.insert(position, _MessageItem(message))
+                except Exception:  # noqa: BLE001
+                    pass
+            self._pending_item = None
+            self._pending_message = None
+            self._hide_send_error()
+            if self._buffer_text().strip() == sent_text:
+                self._set_buffer_text("")
+            self._update_composer()
+            self._schedule_scroll_bottom()
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+
+    # -- read receipts ----------------------------------------------------- #
+    def _mark_read_once(self) -> bool:
+        self._read_id = 0
+        try:
+            if self._destroyed:
+                return False
+            client = getattr(self.ctx, "client", None)
+            mark = getattr(client, "mark_conversation_read", None)
+            if not callable(mark) or not self._conversation_id:
+                return False
+            conversation_id = self._conversation_id
+            participant = self._recipient
+
+            def work() -> None:
+                try:
+                    mark(conversation_id, participant)
+                except Exception:  # noqa: BLE001 - a receipt is best effort
+                    return
+                try:
+                    GLib.idle_add(self._on_read_marked)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            threading.Thread(target=work, daemon=True, name="msg-mark-read").start()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _on_read_marked(self) -> bool:
+        try:
+            if not self._destroyed and isinstance(self.conversation, dict):
+                self.conversation["unreadMessagesCount"] = 0
+                callback = self.on_read
+                if callable(callback):
+                    callback()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     # -- list factory ------------------------------------------------------- #
     def _setup_item(self, _factory, item: Gtk.ListItem) -> None:
@@ -1654,6 +2100,7 @@ class ConversationPage(Gtk.Box):
 
     def _build_message_row(self, message: dict) -> Gtk.Widget:
         mine = _message_is_mine(self.ctx, self.conversation, message)
+        pending = as_bool(message.get("_pending"))
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         row.set_hexpand(True)
         row.add_css_class("db-msg-message-row")
@@ -1663,6 +2110,8 @@ class ConversationPage(Gtk.Box):
         bubble.add_css_class("db-msg-bubble")
         if mine:
             bubble.add_css_class("db-msg-bubble-mine")
+        if pending:
+            bubble.add_css_class("db-msg-pending")
 
         if not mine and self._group:
             raw_sender = _message_sender(message).casefold()
@@ -1710,14 +2159,16 @@ class ConversationPage(Gtk.Box):
             )
 
         stamp = _message_timestamp(message)
-        if stamp:
+        when = "Sending…" if pending else (humanize_time(stamp) if stamp else "")
+        if when:
             time_label = _label(
-                humanize_time(stamp),
+                when,
                 css=("caption", "db-msg-time"),
                 xalign=1.0 if mine else 0.0,
             )
             time_label.set_halign(Gtk.Align.END if mine else Gtk.Align.START)
-            time_label.set_tooltip_text(absolute_time(stamp))
+            if stamp and not pending:
+                time_label.set_tooltip_text(absolute_time(stamp))
             bubble.append(time_label)
 
         spacer = Gtk.Box()
@@ -1927,7 +2378,7 @@ class ConversationPage(Gtk.Box):
                 self._show_state("content")
                 self._set_top_pill(None)
                 if initial or was_underfilled:
-                    GLib.idle_add(self._scroll_to_bottom)
+                    self._schedule_scroll_bottom()
                 elif anchor is not None:
                     GLib.idle_add(self._restore_anchor, anchor)
                 self._schedule_fill()
@@ -2024,6 +2475,22 @@ class ConversationPage(Gtk.Box):
         except Exception:  # noqa: BLE001
             pass
         return False
+
+    def _scroll_to_bottom_soon(self) -> bool:
+        if not self._destroyed:
+            self._scroll_to_bottom()
+        return False
+
+    def _schedule_scroll_bottom(self) -> None:
+        """Scroll now and once more after the new row has been measured."""
+        try:
+            GLib.idle_add(self._scroll_to_bottom)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            GLib.timeout_add(90, self._scroll_to_bottom_soon)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _near_top(self) -> bool:
         adjustment = self._adjustment()
@@ -2176,6 +2643,7 @@ class MessagingPage(Gtk.Box):
         install_css()
         self.ctx = ctx
         self._destroyed = False
+        self._accept_inflight: set[str] = set()
         self.conversation_page: ConversationPage | None = None
 
         # Adw.ViewSwitcher only accepts an Adw.ViewStack, so the tab stack is
@@ -2271,6 +2739,10 @@ class MessagingPage(Gtk.Box):
             return
         self.conversation_page = page
         try:
+            page.on_read = lambda conv=conversation: self._refresh_conversation(conv)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             self.root_stack.add_named(page, "conversation")
             self.root_stack.set_visible_child_name("conversation")
         except Exception:  # noqa: BLE001
@@ -2282,6 +2754,106 @@ class MessagingPage(Gtk.Box):
 
     def show_list(self) -> None:
         self._close_conversation()
+
+    def is_accepting(self, conversation) -> bool:
+        if not isinstance(conversation, dict):
+            return False
+        key = _conversation_id(conversation) or f"object:{id(conversation)}"
+        return key in self._accept_inflight
+
+    def accept_conversation(self, conversation) -> None:
+        """Accept a message request: optimistic move, then confirm off-thread."""
+        if not isinstance(conversation, dict) or self._destroyed:
+            return
+        key = _conversation_id(conversation) or f"object:{id(conversation)}"
+        if key in self._accept_inflight:
+            return
+        client = getattr(self.ctx, "client", None)
+        method = getattr(client, "accept_conversation", None)
+        if not callable(method):
+            demo = bool(getattr(self.ctx, "demo", False))
+            self._toast(
+                "Accepting message requests isn't available in the offline demo."
+                if demo
+                else "Accepting message requests isn't available with this Tumblr client."
+            )
+            return
+        conversation_id = _conversation_id(conversation)
+        participant = _conversation_recipient(conversation, self.ctx)
+        if not conversation_id or not participant:
+            self._toast("Couldn't accept that request: missing conversation details.")
+            return
+
+        self._accept_inflight.add(key)
+        original_pending = conversation.get("pending")
+        original_index = self.requests_tab.remove_conversation(conversation)
+        conversation["pending"] = False
+        moved = False
+        if self.inbox_tab._loaded:
+            moved = self.inbox_tab.add_conversation(conversation, at=0)
+        self.requests_tab.refresh_conversation(conversation)
+
+        def work() -> None:
+            error = ""
+            try:
+                method(conversation_id, participant)
+            except Exception as exc:  # noqa: BLE001 - report on the main loop
+                error = describe_error(exc)
+            try:
+                GLib.idle_add(
+                    self._finish_accept,
+                    conversation,
+                    original_pending,
+                    original_index,
+                    moved,
+                    error,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="msg-accept").start()
+        except Exception as exc:  # noqa: BLE001
+            self._finish_accept(
+                conversation, original_pending, original_index, moved, describe_error(exc)
+            )
+
+    def _finish_accept(
+        self,
+        conversation,
+        original_pending,
+        original_index,
+        moved: bool,
+        error: str,
+    ) -> bool:
+        if not isinstance(conversation, dict):
+            return False
+        key = _conversation_id(conversation) or f"object:{id(conversation)}"
+        self._accept_inflight.discard(key)
+        try:
+            if self._destroyed:
+                return False
+            if error:
+                conversation["pending"] = original_pending
+                if moved:
+                    self.inbox_tab.remove_conversation(conversation)
+                if original_index is not None and self.requests_tab._loaded:
+                    self.requests_tab.add_conversation(conversation, at=original_index)
+                self.requests_tab.refresh_conversation(conversation)
+                self.inbox_tab.refresh_conversation(conversation)
+                self._toast(f"Couldn't accept that request: {error}")
+            else:
+                self.inbox_tab.refresh_conversation(conversation)
+                self._toast("Message request accepted")
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _toast(self, message: str) -> None:
+        try:
+            self.ctx.toast(message)
+        except Exception:  # noqa: BLE001
+            pass
 
     def cleanup(self) -> None:
         self._destroyed = True
@@ -2317,6 +2889,20 @@ class MessagingPage(Gtk.Box):
                     tab.listview.grab_focus()
                 except Exception:  # noqa: BLE001
                     pass
+        # The conversation dict may have been mutated (read receipt), so
+        # rebuild just that row when we are back on the list.
+        for tab in (self.inbox_tab, self.requests_tab):
+            try:
+                tab.refresh_conversation(page.conversation)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _refresh_conversation(self, conversation) -> None:
+        for tab in (self.inbox_tab, self.requests_tab):
+            try:
+                tab.refresh_conversation(conversation)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _on_tab_changed(self, *_args) -> None:
         tab = self.active_tab()
