@@ -19,6 +19,64 @@ def _bad(label: str, detail: str = "") -> None:
     print(f"  \033[31m✗\033[0m {label}" + (f"  {detail}" if detail else ""))
 
 
+
+def _tree_digest(root: Path) -> str:
+    """Content digest over the app's source files (py + css)."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    files = sorted(
+        [p for p in root.rglob("*") if p.is_file() and p.suffix in (".py", ".css")
+         and "__pycache__" not in p.parts]
+    )
+    for path in files:
+        try:
+            digest.update(str(path.relative_to(root)).encode())
+            digest.update(path.read_bytes())
+        except OSError:
+            continue
+    return digest.hexdigest()
+
+
+def _check_install_freshness(problems: int) -> int:
+    """Warn when the running copy is older than the checkout it came from."""
+    import deskboard as package
+
+    running_root = Path(package.__file__).resolve().parent.parent  # .../deskboard -> root
+    build_file = running_root / "BUILD"
+    if not build_file.exists():
+        _ok("Build record", "running from a source checkout")
+        return problems
+    info = {}
+    try:
+        for line in build_file.read_text("utf-8").splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                info[key.strip()] = value.strip()
+    except OSError:
+        return problems
+    source = Path(info.get("source", "")).expanduser()
+    installed_digest = info.get("digest", "")
+    running_digest = _tree_digest(running_root / "deskboard")
+    if installed_digest and running_digest != installed_digest:
+        _warn("Build record", "does not match the installed files (re-run scripts/install.sh)")
+        problems += 1
+    if not source.is_dir():
+        _ok("Build record", f"installed {info.get('installed', '?')} (source checkout not found)")
+        return problems
+    source_digest = _tree_digest(source / "deskboard")
+    if source_digest != running_digest:
+        _warn(
+            "Stale install",
+            f"the running copy differs from {source}\n"
+            "      fix: run ./scripts/install.sh  (then quit and relaunch Deskboard)",
+        )
+        problems += 1
+    else:
+        _ok("Build record", f"up to date with {source} (commit {info.get('commit', '?')})")
+    return problems
+
+
 def run_doctor() -> int:
     from . import config
 
@@ -125,6 +183,10 @@ def run_doctor() -> int:
         except TumblrError as exc:
             _bad("Dashboard", str(exc))
             problems += 1
+    print()
+
+    print("Build")
+    problems = _check_install_freshness(problems)
     print()
 
     print("Storage")

@@ -273,6 +273,9 @@ if [ -d "\$GIR_DIR" ]; then
   export GI_TYPELIB_PATH="\$GIR_DIR\${GI_TYPELIB_PATH:+:\$GI_TYPELIB_PATH}"
 fi
 export PYTHONPATH="\$APP_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+# Run from the install directory: with `-m`, sys.path[0] is the cwd, so a
+# checkout named "deskboard" in the caller's directory would shadow this copy.
+cd "\$APP_DIR"
 exec "\${DESKBOARD_PYTHON:-python3}" -m deskboard "\$@"
 EOF
 then
@@ -293,6 +296,29 @@ ICON_DEST="$ICONS_DIR/$APP_ID.svg"
 cp -f -- "$ROOT/assets/icon.svg" "$ICON_DEST" || die "Could not install the icon."
 chmod 0644 "$ICON_DEST"
 ok "Icon: $ICON_DEST"
+
+# Record provenance so `--doctor` can detect a stale installed copy.
+BUILD_FILE="$BASE/BUILD"
+APP_DIGEST=$("${DESKBOARD_PYTHON:-python3}" - "$BASE/deskboard" <<'PYDIGEST'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+files = sorted(p for p in root.rglob("*")
+               if p.is_file() and p.suffix in (".py", ".css") and "__pycache__" not in p.parts)
+for path in files:
+    digest.update(str(path.relative_to(root)).encode())
+    digest.update(path.read_bytes())
+print(digest.hexdigest())
+PYDIGEST
+)
+GIT_COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+{
+  echo "source=$ROOT"
+  echo "commit=$GIT_COMMIT"
+  echo "installed=$(date -Is)"
+  echo "digest=$APP_DIGEST"
+} > "$BUILD_FILE" || warn "Could not write $BUILD_FILE"
+ok "Build record: $BUILD_FILE (commit $GIT_COMMIT)"
 
 if command -v desktop-file-validate >/dev/null 2>&1; then
   if ! desktop-file-validate "$DESKTOP_DEST" >/dev/null 2>&1; then

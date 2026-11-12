@@ -38,11 +38,16 @@ browser, no JavaScript bundle and no telemetry.
   audio players.
 - Reblog trails with sensible collapsing ("N earlier reblogs"), avatars, tags,
   relative timestamps and note/like/reblog counts.
+- **Stale-install detection**: `--doctor` compares the running copy against the
+  checkout it was installed from and tells you to reinstall if they drift.
 - **Pipelined pagination**: Tumblr serves only ~4 posts per request at
   0.6–1.2 s each, so Deskboard keeps a couple of pages buffered ahead of the
   viewport instead of stalling at the bottom of the feed.
-- **Your tags** section in the sidebar, listing the tags you follow (like the
-  desktop site), each one opening its tag feed.
+- **Your tags** section in the sidebar listing *every* tag you follow (paged to
+  the server's count, scrollable), each with Open Latest / Open Top.
+- **Tag pages with a Latest | Top switch** — the toggle sends the same request
+  the website does (`/v2/hubs/{tag}/timeline?sort=top`); where Tumblr returns an
+  identical set for both, Top additionally orders by note count.
 - Empty/error states and retry everywhere — every network failure becomes an
   inline message, never a traceback in the window.
 - Like and reblog actions with optimistic UI and rollback when Tumblr refuses.
@@ -59,7 +64,7 @@ browser, no JavaScript bundle and no telemetry.
 Captured from the offline demo (`deskboard --demo`) — real widgets, real
 typography, bundled public sample posts.
 
-| Home, light | Following, dark |
+| Home, light | Post, dark |
 | --- | --- |
 | ![Deskboard's Home feed: sidebar with Home, Following, Likes, Your tags, Blogs and Discover, and a post with headings, lists and links](assets/screenshot-home.png) | ![Deskboard in dark mode showing a reblog trail, tags and a photo post](assets/screenshot-post.png) |
 
