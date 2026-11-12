@@ -244,6 +244,22 @@ def test_get_gif_popular_without_a_next_link(monkeypatch):
     assert client.get_gif_popular() == ([], None)
 
 
+def test_get_gif_popular_next_link_without_offset_returns_none(monkeypatch):
+    client = TumblrClient()
+    payload = {
+        "response": {
+            "gifs": [{"id": "g1"}],
+            "links": {"next": {"href": "https://www.tumblr.com/api/v2/gif/popular?limit=20"}},
+        }
+    }
+    monkeypatch.setattr(client, "request", lambda *a, **k: payload)
+
+    gifs, next_offset = client.get_gif_popular()
+
+    assert gifs == [{"id": "g1"}]
+    assert next_offset is None
+
+
 def test_settings_return_the_response_dict(monkeypatch):
     client = TumblrClient()
     monkeypatch.setattr(

@@ -348,6 +348,7 @@ def test_read_paths_never_call_write_methods(monkeypatch):
         "follow",
         "unfollow",
         "mark_conversation_read",
+        "create_post",
         "upload_image",
         "upload_audio",
     ):

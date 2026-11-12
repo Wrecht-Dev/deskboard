@@ -9,6 +9,7 @@ events (``like``/``reblog``/``open-blog`` …) turn into work.
 """
 from __future__ import annotations
 
+import datetime
 import threading
 
 import gi
@@ -46,6 +47,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._reblog_dialog = None
         self._about_dialog = None
         self._signout_dialog = None
+        self._composer = None
         self._unsubscribes: list = []
         self._like_inflight: set[str] = set()
 
@@ -121,8 +123,14 @@ class MainWindow(Adw.ApplicationWindow):
         self.refresh_button.connect("clicked", lambda *_args: self.refresh_current())
         header.pack_start(self.refresh_button)
 
+        self.compose_button = Gtk.Button.new_from_icon_name("document-new-symbolic")
+        self.compose_button.set_tooltip_text("New post (Ctrl+N)")
+        self.compose_button.connect("clicked", lambda *_args: self.open_composer())
+        header.pack_end(self.compose_button)
+
         menu = Gio.Menu()
         section = Gio.Menu()
+        section.append("New post", "win.compose")
         section.append("Refresh", "win.refresh")
         section.append("Search", "win.search")
         menu.append_section(None, section)
@@ -184,6 +192,7 @@ class MainWindow(Adw.ApplicationWindow):
         specs = (
             ("refresh", self.refresh_current),
             ("search", self.focus_search),
+            ("compose", self.open_composer),
             ("preferences", self.open_settings),
             ("about", self._show_about),
             ("sign-out", self._confirm_sign_out),
@@ -203,6 +212,7 @@ class MainWindow(Adw.ApplicationWindow):
             for action_name, accels in (
                 ("win.refresh", ["<Control>r"]),
                 ("win.search", ["<Control>f"]),
+                ("win.compose", ["<Control>n"]),
                 ("win.preferences", ["<Control>comma"]),
             ):
                 try:
@@ -606,6 +616,88 @@ class MainWindow(Adw.ApplicationWindow):
         page.on_back = True
         return page
 
+    # -- composer ---------------------------------------------------------- #
+    def open_composer(self, attachments=None) -> None:
+        """Open the writing window, optionally with uploaded media."""
+        if not getattr(self.ctx, "demo", False) and not self.ctx.is_signed_in:
+            self.toast("Sign in to write posts.")
+            self.show_onboarding()
+            return
+        blogs = [str(name) for name in (getattr(self.ctx, "user_blogs", None) or []) if name]
+        if not blogs and getattr(self.ctx, "user_blog", ""):
+            blogs = [str(self.ctx.user_blog)]
+        if not blogs:
+            user = str(getattr(self.ctx, "user_name", "") or "")
+            if user:
+                blogs = [user]
+        if not blogs:
+            if self.ctx.is_signed_in:
+                self.toast("Loading your blogs…")
+                try:
+                    self.ctx.load_user(
+                        lambda _ok: GLib.idle_add(
+                            self._open_composer_after_user, attachments
+                        )
+                    )
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
+            self.toast("No blog is available to post to.")
+            return
+        self._open_composer_after_user(attachments)
+
+    def _open_composer_after_user(self, attachments=None) -> bool:
+        if self._composer is not None:
+            try:
+                for media in attachments or []:
+                    self._composer.add_media(media)
+                self._composer.present()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        try:
+            from .composer import ComposerWindow
+
+            composer = ComposerWindow(
+                self.ctx,
+                parent=self,
+                attachments=attachments or [],
+                on_done=self._on_composer_done,
+                on_closed=lambda: setattr(self, "_composer", None),
+            )
+            self._composer = composer
+            composer.present()
+        except Exception as exc:  # noqa: BLE001
+            self._composer = None
+            self.toast(f"Couldn't open the composer: {exc}")
+        return False
+
+    def add_composer_media(self, media) -> None:
+        """Forward one uploaded media dict to the open composer."""
+        if self._composer is not None:
+            try:
+                self._composer.add_media(media)
+                self._composer.present()
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        self.open_composer(attachments=[media] if media else [])
+
+    def _on_composer_done(self, state: str, result) -> None:
+        try:
+            page = self.page_widget
+            if page is None:
+                return
+            name = type(page).__name__
+            if (state == "draft" and name == "DraftsPage") or (
+                state == "queue" and name == "QueuePage"
+            ):
+                refresh = getattr(page, "refresh", None)
+                if callable(refresh):
+                    refresh()
+        except Exception:  # noqa: BLE001
+            pass
+
     def open_post(self, post) -> None:
         """Open a post permalink page when the detail module is available."""
         if post is None:
@@ -913,18 +1005,28 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self.open_reblog_dialog(post)
 
-    def _reblog_write(self, post, blog: str, comment: str, tags: str = "") -> None:
-        """Call the client's reblog endpoint, tolerating older demo clients."""
+    def _reblog_write(self, post, blog: str, comment: str = "", tags: str = "",
+                      publish_on: str | None = None) -> None:
+        """Call the client's reblog endpoint, tolerating older clients."""
         client = self.ctx.client
-        supports_tags = False
+        params = {}
         try:
             import inspect
 
-            supports_tags = "tags" in inspect.signature(client.reblog).parameters
+            params = inspect.signature(client.reblog).parameters
         except Exception:  # noqa: BLE001
-            supports_tags = False
+            params = {}
+        supports_tags = "tags" in params
+        supports_publish = "publish_on" in params
+        if publish_on and not supports_publish:
+            raise RuntimeError("This client cannot schedule reblogs.")
+        kwargs = {}
         if supports_tags:
-            client.reblog(post, blog, comment, tags=tags)
+            kwargs["tags"] = tags
+        if supports_publish and publish_on:
+            kwargs["publish_on"] = publish_on
+        if supports_tags:
+            client.reblog(post, blog, comment, **kwargs)
         else:
             client.reblog(post, blog, comment)
 
@@ -945,12 +1047,14 @@ class MainWindow(Adw.ApplicationWindow):
                 pass
             self._reblog_dialog = None
 
+        demo = bool(getattr(self.ctx, "demo", False))
+        schedule_state = {"iso": None, "display": ""}
         try:
             dialog = Adw.Dialog()
             dialog.set_title("Reblog")
             try:
-                dialog.set_content_width(520)
-                dialog.set_content_height(460)
+                dialog.set_content_width(560)
+                dialog.set_content_height(580)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -967,14 +1071,11 @@ class MainWindow(Adw.ApplicationWindow):
             cancel_button.add_css_class("flat")
             cancel_button.connect("clicked", lambda *_args: dialog.close())
             header.pack_start(cancel_button)
-            reblog_button = Gtk.Button(label="Reblog")
-            reblog_button.add_css_class("suggested-action")
-            header.pack_end(reblog_button)
             toolbar.add_top_bar(header)
 
-            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
             body.set_margin_top(14)
-            body.set_margin_bottom(16)
+            body.set_margin_bottom(10)
             body.set_margin_start(16)
             body.set_margin_end(16)
             caption = Gtk.Label(label="Add a comment", xalign=0)
@@ -995,9 +1096,19 @@ class MainWindow(Adw.ApplicationWindow):
             scroller = Gtk.ScrolledWindow()
             scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
             scroller.set_child(frame)
-            scroller.set_min_content_height(160)
+            scroller.set_min_content_height(145)
             scroller.set_vexpand(True)
             body.append(scroller)
+
+            now_note = Gtk.Label(
+                label="Reblog now sends only the post; your text won't be added."
+            )
+            now_note.set_wrap(True)
+            now_note.set_xalign(0)
+            now_note.add_css_class("caption")
+            now_note.add_css_class("dim-label")
+            now_note.set_visible(False)
+            body.append(now_note)
 
             tags_caption = Gtk.Label(label="Tags (comma separated)", xalign=0)
             tags_caption.add_css_class("caption")
@@ -1006,34 +1117,210 @@ class MainWindow(Adw.ApplicationWindow):
             tags_entry.set_placeholder_text("art, photography, design")
             tags_entry.set_hexpand(True)
             body.append(tags_entry)
+
+            error_label = Gtk.Label(label="")
+            error_label.set_wrap(True)
+            error_label.set_xalign(0)
+            error_label.add_css_class("composer-error")
+            error_label.set_visible(False)
+            body.append(error_label)
+
+            demo_notice = Gtk.Label(
+                label="Demo mode: reblogging is disabled. Nothing will be posted."
+            )
+            demo_notice.set_wrap(True)
+            demo_notice.set_xalign(0)
+            demo_notice.add_css_class("composer-notice")
+            demo_notice.set_visible(demo)
+            body.append(demo_notice)
+
+            bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            bar.add_css_class("composer-actionbar")
+
+            schedule_menu = Gtk.MenuButton()
+            schedule_menu.set_icon_name("alarm-symbolic")
+            schedule_menu.set_tooltip_text("Choose a schedule time")
+            schedule_menu.add_css_class("flat")
+            bar.append(schedule_menu)
+            schedule_label = Gtk.Label(label="Choose time")
+            schedule_label.add_css_class("caption")
+            schedule_label.add_css_class("dim-label")
+            bar.append(schedule_label)
+            spinner = Adw.Spinner()
+            spinner.set_size_request(18, 18)
+            spinner.set_visible(False)
+            bar.append(spinner)
+
+            spacer = Gtk.Box()
+            spacer.set_hexpand(True)
+            bar.append(spacer)
+
+            now_button = Gtk.Button(label="Reblog now")
+            now_button.set_tooltip_text("Reblog the post without your commentary")
+            bar.append(now_button)
+            schedule_action = Gtk.Button(label="Schedule")
+            schedule_action.set_tooltip_text("Schedule this reblog for the chosen time")
+            schedule_action.set_sensitive(False)
+            bar.append(schedule_action)
+            reblog_button = Gtk.Button(label="Reblog")
+            reblog_button.add_css_class("suggested-action")
+            bar.append(reblog_button)
+            toolbar.add_bottom_bar(bar)
+
+            popover = Gtk.Popover()
+            pop_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            pop_box.set_margin_start(12)
+            pop_box.set_margin_end(12)
+            pop_box.set_margin_top(12)
+            pop_box.set_margin_bottom(12)
+            calendar = Gtk.Calendar()
+            pop_box.append(calendar)
+            now = datetime.datetime.now()
+            time_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            time_caption = Gtk.Label(label="Time")
+            time_caption.add_css_class("caption")
+            time_caption.add_css_class("dim-label")
+            time_row.append(time_caption)
+            hour_spin = Gtk.SpinButton.new_with_range(0, 23, 1)
+            hour_spin.set_value(min(23, now.hour + 1))
+            hour_spin.set_digits(0)
+            time_row.append(hour_spin)
+            time_row.append(Gtk.Label(label=":"))
+            minute_spin = Gtk.SpinButton.new_with_range(0, 59, 5)
+            minute_spin.set_value((now.minute // 5) * 5)
+            minute_spin.set_digits(0)
+            time_row.append(minute_spin)
+            pop_box.append(time_row)
+            pop_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            clear_button = Gtk.Button(label="Clear")
+            clear_button.add_css_class("flat")
+            pop_buttons.append(clear_button)
+            pop_spacer = Gtk.Box()
+            pop_spacer.set_hexpand(True)
+            pop_buttons.append(pop_spacer)
+            set_button = Gtk.Button(label="Set time")
+            set_button.add_css_class("suggested-action")
+            pop_buttons.append(set_button)
+            pop_box.append(pop_buttons)
+            popover.set_child(pop_box)
+            schedule_menu.set_popover(popover)
+
+            def clear_schedule() -> None:
+                schedule_state["iso"] = None
+                schedule_state["display"] = ""
+                schedule_label.set_text("Choose time")
+                schedule_action.set_sensitive(False)
+                error_label.set_visible(False)
+                try:
+                    popover.popdown()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def apply_schedule() -> None:
+                try:
+                    date = calendar.get_date()
+                    local = datetime.datetime(
+                        int(date.get_year()),
+                        int(date.get_month()),
+                        int(date.get_day_of_month()),
+                        int(hour_spin.get_value()),
+                        int(minute_spin.get_value()),
+                    ).astimezone()
+                    if local <= datetime.datetime.now().astimezone():
+                        error_label.set_text("Choose a time in the future.")
+                        error_label.set_visible(True)
+                        return
+                    utc = local.astimezone(datetime.timezone.utc)
+                    schedule_state["iso"] = utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    schedule_state["display"] = local.strftime("%b %d, %H:%M")
+                    schedule_label.set_text(local.strftime("%b %d, %H:%M"))
+                    schedule_action.set_sensitive(not demo)
+                    error_label.set_visible(False)
+                    popover.popdown()
+                except Exception as exc:  # noqa: BLE001
+                    error_label.set_text(f"Could not set that time: {exc}")
+                    error_label.set_visible(True)
+
+            clear_button.connect("clicked", lambda *_args: clear_schedule())
+            set_button.connect("clicked", lambda *_args: apply_schedule())
+
             toolbar.set_content(body)
             dialog.set_child(toolbar)
 
-            def on_reblog(*_args) -> None:
+            def comment_text() -> str:
                 try:
-                    comment = buffer.get_text(
+                    return buffer.get_text(
                         buffer.get_start_iter(), buffer.get_end_iter(), True
                     ).strip()
                 except Exception:  # noqa: BLE001
-                    comment = ""
+                    return ""
+
+            def on_comment_changed(_buffer) -> None:
+                try:
+                    now_note.set_visible(bool(comment_text()))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            buffer.connect("changed", on_comment_changed)
+
+            def set_busy(busy: bool, status: str = "") -> None:
+                for button in (now_button, reblog_button):
+                    button.set_sensitive(not busy and not demo)
+                schedule_action.set_sensitive(
+                    not busy and not demo and bool(schedule_state["iso"])
+                )
+                schedule_menu.set_sensitive(not busy and not demo)
+                cancel_button.set_sensitive(not busy)
+                spinner.set_visible(busy)
+                if status:
+                    schedule_label.set_text(status)
+                elif schedule_state["display"]:
+                    schedule_label.set_text(schedule_state["display"])
+                else:
+                    schedule_label.set_text("Choose time")
+                if busy:
+                    error_label.set_visible(False)
+
+            def submit(mode: str) -> None:
+                if demo:
+                    error_label.set_text("Demo mode: reblogging is disabled.")
+                    error_label.set_visible(True)
+                    self.toast("Demo mode: reblogging is disabled.")
+                    return
+                comment = comment_text() if mode != "now" else ""
+                tags = ""
                 try:
                     tags = tags_entry.get_text().strip()
                 except Exception:  # noqa: BLE001
                     tags = ""
-                reblog_button.set_sensitive(False)
-                cancel_button.set_sensitive(False)
-                reblog_button.set_label("Reblogging…")
+                publish_on = None
+                if mode == "schedule":
+                    publish_on = schedule_state["iso"]
+                    if not publish_on:
+                        error_label.set_text("Choose a schedule time first.")
+                        error_label.set_visible(True)
+                        return
+                    display = schedule_state["display"]
+                else:
+                    display = ""
+                error_label.set_visible(False)
+                set_busy(True, "Scheduling…" if mode == "schedule" else "Reblogging…")
 
                 def apply(error: str) -> bool:
                     try:
                         if error:
-                            reblog_button.set_label("Reblog")
-                            reblog_button.set_sensitive(True)
-                            cancel_button.set_sensitive(True)
+                            set_busy(False)
+                            error_label.set_text(f"Couldn't reblog: {error}")
+                            error_label.set_visible(True)
                             self.toast(f"Couldn't reblog: {error}")
                         else:
                             dialog.close()
-                            self.toast(f"Reblogged to {blog}")
+                            if mode == "now":
+                                self.toast(f"Reblogged now to {blog}")
+                            elif mode == "schedule":
+                                self.toast(f"Scheduled for {display} — added to queue")
+                            else:
+                                self.toast(f"Reblogged to {blog}")
                     except Exception:  # noqa: BLE001
                         pass
                     return False
@@ -1041,7 +1328,7 @@ class MainWindow(Adw.ApplicationWindow):
                 def work() -> None:
                     error = ""
                     try:
-                        self._reblog_write(post, blog, comment, tags)
+                        self._reblog_write(post, blog, comment, tags, publish_on)
                     except Exception as exc:  # noqa: BLE001
                         error = " ".join(str(exc).split()) or "Tumblr refused the request."
                     try:
@@ -1054,7 +1341,14 @@ class MainWindow(Adw.ApplicationWindow):
                 except Exception as exc:  # noqa: BLE001
                     apply(str(exc))
 
-            reblog_button.connect("clicked", on_reblog)
+            now_button.connect("clicked", lambda *_args: submit("now"))
+            schedule_action.connect("clicked", lambda *_args: submit("schedule"))
+            reblog_button.connect("clicked", lambda *_args: submit("comment"))
+
+            if demo:
+                for button in (now_button, schedule_action, reblog_button):
+                    button.set_sensitive(False)
+                schedule_menu.set_sensitive(False)
 
             def on_closed(_dialog) -> None:
                 self._reblog_dialog = None

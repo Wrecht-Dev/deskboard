@@ -609,12 +609,26 @@ class TumblrClient:
     def unlike(self, post: Post) -> None:
         self.request("/v2/user/unlike", method="POST", body={"id": post.id, "reblog_key": post.reblog_key})
 
-    def reblog(self, post: Post, blog: str, comment: str = "", tags: str | list[str] | None = None) -> None:
-        """Reblog ``post`` to ``blog`` with optional commentary and tags."""
-        body: dict[str, Any] = {"id": post.id, "reblog_key": post.reblog_key, "comment": comment}
+    def reblog(self, post: Post, blog: str, comment: str = "", tags: str | list[str] | None = None,
+               publish_on: str | None = None) -> None:
+        """Reblog ``post`` to ``blog``.
+
+        Covers the three actions Tumblr's own dialog offers:
+
+        * **Reblog (with text)** — pass ``comment``;
+        * **Reblog now** — leave ``comment=""`` so only the post is reblogged;
+        * **Schedule reblog** — pass ``publish_on`` (ISO-8601 UTC) and Tumblr
+          queues it for that time.
+
+        ``publish_on`` is the only field not confirmed against a live write
+        (scheduling is a public action); the rest is verified.
+        """
+        body: dict[str, Any] = {"id": post.id, "reblog_key": post.reblog_key, "comment": comment or ""}
         if tags:
             body["tags"] = ",".join(tags) if isinstance(tags, (list, tuple)) else str(tags)
-        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/post/reblog", method="POST", body=body)
+        if publish_on:
+            body["publish_on"] = publish_on
+        self.request(f"/v2/blog/{urllib.parse.quote(post_blog := blog)}/post/reblog", method="POST", body=body)
 
     def reply(self, post: Post, blog: str, text: str, reply_as: str | None = None) -> None:
         """Reply to a post (the note visible on the post page)."""

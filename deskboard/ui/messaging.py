@@ -2003,6 +2003,7 @@ class ConversationPage(Gtk.Box):
 
             message.pop("_pending", None)
             message.pop("_local", None)
+            self._remember_local_send(message)
             if position >= 0:
                 try:
                     # Replace the row so the dimmed "sending" bubble becomes a
@@ -2021,6 +2022,22 @@ class ConversationPage(Gtk.Box):
             return False
         except Exception:  # noqa: BLE001
             return False
+
+    def _remember_local_send(self, message: dict) -> None:
+        """Keep the list row's snippet/time honest without another request."""
+        try:
+            if not isinstance(self.conversation, dict):
+                return
+            self.conversation["lastModifiedTs"] = (
+                message.get("timestamp") or int(time.time())
+            )
+            history = self.conversation.get("messages")
+            if isinstance(history, list):
+                history.append(dict(message))
+            else:
+                self.conversation["messages"] = [dict(message)]
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- read receipts ----------------------------------------------------- #
     def _mark_read_once(self) -> bool:
@@ -2052,11 +2069,13 @@ class ConversationPage(Gtk.Box):
 
     def _on_read_marked(self) -> bool:
         try:
-            if not self._destroyed and isinstance(self.conversation, dict):
+            # Mutate the shared conversation dict even if this page closed while
+            # the receipt was in flight, so the list badge clears eventually.
+            if isinstance(self.conversation, dict):
                 self.conversation["unreadMessagesCount"] = 0
-                callback = self.on_read
-                if callable(callback):
-                    callback()
+            callback = self.on_read
+            if callable(callback):
+                callback()
         except Exception:  # noqa: BLE001
             pass
         return False

@@ -1,0 +1,44 @@
+/* Composer media attachments + GIF picker — owner: media. */
+
+.db-attach-tray {
+  padding: 0;
+}
+
+.db-attach-status {
+  font-size: 12px;
+  margin-left: 4px;
+  margin-right: 4px;
+  opacity: 0.8;
+}
+
+.db-attach-error {
+  color: #d05656;
+  opacity: 1;
+}
+
+.db-gif-tile {
+  border-radius: 8px;
+  background-color: alpha(currentColor, 0.06);
+}
+
+.db-gif-badge {
+  background-color: alpha(black, 0.62);
+  color: white;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.db-gif-footer {
+  padding: 6px 12px;
+}
+
+.db-gif-title {
+  font-weight: 600;
+}
+
+.db-gif-hint {
+  font-size: 12px;
+  opacity: 0.7;
+}
