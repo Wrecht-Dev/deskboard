@@ -1,5 +1,7 @@
 <div align="center">
 
+**Cross-platform rewrite:** [Wrecht-Dev/deskboard-native](https://github.com/Wrecht-Dev/deskboard-native) — C#/.NET 10 + Avalonia.
+
 > **Status: rough proof of concept.**
 > Deskboard is an experimental Linux client built to answer one question — can
 > Tumblr's web client be reproduced as a fast native desktop app? It works, but
