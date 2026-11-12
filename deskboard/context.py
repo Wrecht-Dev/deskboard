@@ -41,6 +41,10 @@ class AppContext:
                 cookies=self.session.cookies,
                 on_auth_failed=self._refresh_session_from_browser,
             )
+            try:
+                self.client.ensure_token()
+            except Exception:  # noqa: BLE001 - retried on the first request
+                pass
             self.user_name = ""
             self.user_blog = ""
             self.user_blogs = []

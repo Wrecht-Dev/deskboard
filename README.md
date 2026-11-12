@@ -1,5 +1,15 @@
 <div align="center">
 
+> **Status: rough proof of concept.**
+> Deskboard is an experimental Linux client built to answer one question — can
+> Tumblr's web client be reproduced as a fast native desktop app? It works, but
+> it is not production software: the API surface is Tumblr's private web API,
+> it is Linux-only, and the code is a prototype. It is expected to be **rewritten
+> in a better cross-platform language** and released for **Windows and macOS**.
+> Treat this repository as a proof of concept and a specification of what the
+> rewrite should do, not as a supported product.
+
+
 <img src="assets/icon.svg" width="112" height="112" alt="Deskboard icon">
 
 # Deskboard
@@ -73,6 +83,24 @@ typography, bundled public sample posts.
 | --- | --- |
 | ![Deskboard's Home feed: sidebar with Home, Following, Likes, Your tags, Blogs and Discover, and a post with headings, lists and links](assets/screenshot-home.png) | ![Deskboard in dark mode showing a reblog trail, tags and a photo post](assets/screenshot-post.png) |
 
+## Roadmap
+
+This repository is a **proof of concept** and is not the final form of the
+project.
+
+- **Rewrite in a cross-platform language.** The current code is Python +
+  PyGObject and therefore tied to Linux/GTK. The plan is a rewrite in a language
+  with a mature cross-platform UI/runtime story so one codebase can target
+  Windows, macOS and Linux with native-feeling performance.
+- **Windows and macOS releases.** The rewrite targets all three desktop
+  platforms; this PoC only ever claimed Linux.
+- **What this code is good for.** It documents the API surface
+  ([`docs/COVERAGE.md`](docs/COVERAGE.md)): endpoints, payload shapes, write-auth
+  (session cookies + CSRF token from the dashboard bootstrap), pagination
+  behaviour, and the UX decisions (trails, media, composer, queue). That is the
+  specification the rewrite should follow.
+- **Not planned here:** continued feature work on the Python/GTK codebase.
+
 ## Requirements
 
 - Linux (X11 or Wayland) with GTK 4 and libadwaita.
@@ -140,6 +168,18 @@ if GTK 4 already imports, it exits immediately. The installed launcher and
 ```bash
 . scripts/env.sh
 ```
+
+## Security and privacy
+
+- **No credentials are stored in this repository.** Tumblr's public web token is
+  fetched from the site on first launch and cached locally with mode `0600`
+  (`~/.config/deskboard/api_token`). Your session cookies live only in
+  `~/.local/share/deskboard/cookies.json`, also `0600`, never in git.
+- **No telemetry.** The app talks only to `www.tumblr.com` and Tumblr's
+  image/video CDNs. Nothing is sent anywhere else.
+- **Writes** use the account's own session plus the per-session CSRF token; the
+  client never fabricates credentials.
+- See [`SECURITY.md`](SECURITY.md) for reporting and the full data-handling note.
 
 ## Signing in
 

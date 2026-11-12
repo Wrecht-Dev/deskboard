@@ -13,10 +13,11 @@ APP_VERSION = "0.3.0"
 ORIGIN = "https://www.tumblr.com"
 API_BASE = ORIGIN + "/api"
 
-# Public bearer token served inside Tumblr's own web bootstrap payload. It is the
-# same credential the website hands every visitor, so it authorises exactly what a
-# logged-out browser can see. A personal session cookie unlocks the rest.
-DEFAULT_API_TOKEN = ""
+# No credential is stored in this repository. Tumblr's public web token is served
+# to every visitor inside the site bootstrap; Deskboard fetches it on first launch
+# and caches it locally (0600) under the config directory. Set DESKBOARD_API_TOKEN
+# to override.
+DEFAULT_API_TOKEN = os.environ.get("DESKBOARD_API_TOKEN", "")
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -40,6 +41,7 @@ CONFIG_DIR = _xdg("XDG_CONFIG_HOME", "~/.config")
 IMAGE_CACHE_DIR = CACHE_DIR / "images"
 MEDIA_CACHE_DIR = CACHE_DIR / "media"
 COOKIE_FILE = DATA_DIR / "cookies.json"
+TOKEN_FILE = CONFIG_DIR / "api_token"
 PREFS_FILE = CONFIG_DIR / "preferences.json"
 
 # Text sizing / layout knobs used by the post renderers.

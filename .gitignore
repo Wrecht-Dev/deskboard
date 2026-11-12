@@ -19,6 +19,11 @@ htmlcov/
 # Runtime data that must never be committed
 data/cache/
 cookies.json
+api_token
+preferences.json
+BUILD
+*.db
+*.sqlite
 *.cookies
 *.log
 

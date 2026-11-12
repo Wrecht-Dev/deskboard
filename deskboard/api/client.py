@@ -206,6 +206,19 @@ class TumblrClient:
         except json.JSONDecodeError as exc:
             raise TumblrError("Tumblr sent an unreadable response.", url=url) from exc
 
+    def ensure_token(self) -> bool:
+        """Load the site's public web token, from the cache or the website."""
+        if self.token:
+            return True
+        try:
+            cached = config.TOKEN_FILE.read_text("utf-8").strip()
+        except OSError:
+            cached = ""
+        if cached:
+            self.token = cached
+            return True
+        return self.refresh_token()
+
     def refresh_token(self) -> bool:
         """Re-read the bearer token from the website bootstrap."""
         with self._lock:
@@ -225,9 +238,15 @@ class TumblrClient:
         if not match:
             return False
         candidate = match.group(1)
-        if candidate == self.token:
-            return False
         self.token = candidate
+        try:
+            config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            config.TOKEN_FILE.write_text(candidate, "utf-8")
+            import os as _os
+
+            _os.chmod(config.TOKEN_FILE, 0o600)
+        except OSError:
+            pass
         return True
 
     def csrf_token(self, refresh: bool = False) -> str | None:
