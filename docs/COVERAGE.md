@@ -44,7 +44,7 @@ deliberately **not** exercised (they mutate the account).
 | Reblog — 3 modes (with text / now / scheduled) | `POST /v2/blog/{blog}/post/reblog` | ✅ UI wired; `publish_on` inferred (scheduling unverified) |
 | Follow / unfollow | `POST /v2/user/follow`, `/v2/user/unfollow` | ✅ blog header button; revert on error |
 | Reply to a post | `POST /v2/user/post/reply` | ✅ post-detail composer; optimistic prepend |
-| Send ask / submit | ✗ not found at guessed paths | ❗ needs RE |
+| Send ask | `POST /v2/blog/{blog}/ask` | ✅ client + UI wiring; route/param confirmed |
 | Mute a post (in-feed) | `POST/DELETE /v2/blog/{blog}/posts/{id}/mute` | 🟡 client ready; card-menu wiring pending |
 | DM send / accept / read | `POST /v2/conversations/messages`, `/accept`, `/mark_as_read` | ✅ composer, accept, auto mark-read |
 
@@ -69,7 +69,7 @@ restored like. `POST /v2/oauth2/token` turned out to be login-only
 
 | Feature | Endpoint | Status |
 |---|---|---|
-| Create post (NPF text/quote/link + images) | `POST /v2/blog/{blog}/posts` | ✅ composer; text/quote/link + attachments |
+| Create post (NPF text/quote/link + images) | `POST /v2/blog/{blog}/posts` | ✅ composer; text/quote/link + attachments + `state=submission` |
 | Edit / delete post | `PUT`/`DELETE /v2/blog/{blog}/post/{id}` (POST route confirmed for reblog only) | ❗ |
 | Upload image | `POST /v2/media/image` | ✅ attach tray (audio not wired) |
 | GIF library | `GET /v2/gif/popular` | ✅ picker (popular only; no search endpoint) |
