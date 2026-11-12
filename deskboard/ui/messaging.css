@@ -270,3 +270,16 @@
   padding: 2px 12px;
   font-size: 0.86em;
 }
+
+/* ---------------------------------------------------- conversation actions */
+.db-msg-actions {
+  padding: 6px;
+}
+
+.db-msg-actions button {
+  min-height: 30px;
+}
+
+.db-msg-action-hint {
+  padding: 4px 8px 2px 8px;
+}

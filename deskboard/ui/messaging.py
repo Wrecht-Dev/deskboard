@@ -1565,6 +1565,9 @@ class ConversationPage(Gtk.Box):
         self._pending_message: dict | None = None
         self._read_id = 0
         self.on_read = None
+        self.on_deleted = None
+        self._action_inflight = False
+        self._confirm_dialog = None
 
         self.store = Gio.ListStore(item_type=_MessageItem)
         self.selection = Gtk.NoSelection(model=self.store)
@@ -1702,7 +1705,265 @@ class ConversationPage(Gtk.Box):
         self.handle_label.set_visible(bool(handle))
         titles.append(self.handle_label)
 
+        self.menu_button = Gtk.MenuButton()
+        self.menu_button.set_icon_name("view-more-symbolic")
+        self.menu_button.add_css_class("flat")
+        self.menu_button.set_tooltip_text("Conversation actions")
+        self.menu_button.set_valign(Gtk.Align.CENTER)
+        self._actions_popover = self._build_actions_popover()
+        self.menu_button.set_popover(self._actions_popover)
+        header.append(self.menu_button)
         return header
+
+    # -- conversation actions ---------------------------------------------- #
+    def _action_reason(self, method_name: str) -> str:
+        """Why a conversation action is unavailable, or ``""`` if it may run."""
+        if bool(getattr(self.ctx, "demo", False)):
+            return "Conversation actions aren't available in the offline demo."
+        client = getattr(self.ctx, "client", None)
+        if not callable(getattr(client, method_name, None)):
+            return "This Tumblr client doesn't support that action."
+        if not self._conversation_id or not self._recipient:
+            return "Conversation actions aren't available for this conversation."
+        return ""
+
+    @staticmethod
+    def _action_button(icon: str, label: str, callback) -> Gtk.Button:
+        button = Gtk.Button()
+        button.add_css_class("flat")
+        button.set_halign(Gtk.Align.FILL)
+        content = Adw.ButtonContent(icon_name=icon, label=label)
+        content.set_halign(Gtk.Align.START)
+        button.set_child(content)
+        button.connect("clicked", lambda *_args: callback())
+        return button
+
+    def _build_actions_popover(self) -> Gtk.Popover:
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.add_css_class("db-msg-actions")
+        popover.set_child(box)
+
+        self._delete_reason = self._action_reason("delete_conversation")
+        self._flag_reason = self._action_reason("flag_conversation")
+        self.delete_button = self._action_button(
+            "edit-delete-symbolic", "Delete conversation", self._on_delete_clicked
+        )
+        self.flag_button = self._action_button(
+            "dialog-warning-symbolic", "Report spam", self._on_flag_clicked
+        )
+        box.append(self.delete_button)
+        box.append(self.flag_button)
+
+        self._action_hint = _label("", css=("caption", "dim-label", "db-msg-action-hint"))
+        self._action_hint.set_wrap(True)
+        self._action_hint.set_max_width_chars(34)
+        self._action_hint.set_visible(False)
+        if bool(getattr(self.ctx, "demo", False)):
+            # Hide the actions entirely in the offline demo, but keep the menu
+            # honest instead of offering buttons that cannot work.
+            self.delete_button.set_visible(False)
+            self.flag_button.set_visible(False)
+            self._action_hint.set_text(
+                "Conversation actions aren't available in the offline demo."
+            )
+            self._action_hint.set_visible(True)
+        box.append(self._action_hint)
+        self._sync_action_buttons()
+        return popover
+
+    def _sync_action_buttons(self) -> None:
+        try:
+            for button, reason in (
+                (self.delete_button, self._delete_reason),
+                (self.flag_button, self._flag_reason),
+            ):
+                button.set_sensitive(not reason and not self._action_inflight)
+                button.set_tooltip_text(reason or None)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_delete_clicked(self) -> None:
+        try:
+            self._actions_popover.popdown()
+        except Exception:  # noqa: BLE001
+            pass
+        self.delete_conversation()
+
+    def _on_flag_clicked(self) -> None:
+        try:
+            self._actions_popover.popdown()
+        except Exception:  # noqa: BLE001
+            pass
+        self.flag_conversation()
+
+    def delete_conversation(self) -> None:
+        """Ask for confirmation, then delete this conversation."""
+        if self._action_inflight:
+            return
+        reason = self._action_reason("delete_conversation")
+        if reason:
+            self._toast(reason)
+            return
+        self._ask_confirmation(
+            "Delete this conversation?",
+            "This removes the conversation from your inbox. This can't be undone.",
+            "Delete",
+            self._perform_delete,
+            destructive=True,
+        )
+
+    def flag_conversation(self) -> None:
+        """Ask for confirmation, then report this conversation as spam."""
+        if self._action_inflight:
+            return
+        reason = self._action_reason("flag_conversation")
+        if reason:
+            self._toast(reason)
+            return
+        self._ask_confirmation(
+            "Report this conversation as spam?",
+            "Tumblr will review the conversation. It stays in your inbox.",
+            "Report",
+            self._perform_flag,
+        )
+
+    def _ask_confirmation(
+        self, heading: str, body: str, response_label: str, on_confirm, destructive: bool = False
+    ) -> None:
+        """Show an Adw.AlertDialog; tests replace this hook (no real dialog)."""
+        try:
+            dialog = Adw.AlertDialog()
+            dialog.set_heading(heading)
+            dialog.set_body(body)
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("confirm", response_label)
+            if destructive:
+                dialog.set_response_appearance(
+                    "confirm", Adw.ResponseAppearance.DESTRUCTIVE
+                )
+            dialog.set_default_response("cancel")
+            dialog.set_close_response("cancel")
+
+            def on_response(_dialog, response: str) -> None:
+                self._confirm_dialog = None
+                if response == "confirm":
+                    try:
+                        on_confirm()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            dialog.connect("response", on_response)
+            self._confirm_dialog = dialog
+            parent = self.get_root()
+            if parent is not None:
+                dialog.present(parent)
+            else:
+                dialog.present(None)
+        except Exception as exc:  # noqa: BLE001
+            self._confirm_dialog = None
+            self._toast(f"Couldn't open the confirmation: {describe_error(exc)}")
+
+    def _perform_delete(self) -> None:
+        if self._action_inflight or self._destroyed:
+            return
+        reason = self._action_reason("delete_conversation")
+        if reason:
+            self._toast(reason)
+            return
+        client = getattr(self.ctx, "client", None)
+        method = getattr(client, "delete_conversation", None)
+        conversation_id = self._conversation_id
+        participant = self._recipient
+        self._action_inflight = True
+        self._sync_action_buttons()
+
+        def work() -> None:
+            error = ""
+            try:
+                method(conversation_id, participant)
+            except Exception as exc:  # noqa: BLE001 - report on the main loop
+                error = describe_error(exc)
+            try:
+                GLib.idle_add(self._finish_delete, error)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="msg-delete").start()
+        except Exception as exc:  # noqa: BLE001
+            self._finish_delete(describe_error(exc))
+
+    def _finish_delete(self, error: str) -> bool:
+        self._action_inflight = False
+        try:
+            if self._destroyed:
+                return False
+            if error:
+                self._sync_action_buttons()
+                self._toast(f"Couldn't delete the conversation: {error}")
+                return False
+            callback = self.on_deleted
+            if callable(callback):
+                callback()
+            else:
+                self._toast("Conversation deleted")
+                back = self.on_back
+                if callable(back):
+                    back()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _perform_flag(self) -> None:
+        if self._action_inflight or self._destroyed:
+            return
+        reason = self._action_reason("flag_conversation")
+        if reason:
+            self._toast(reason)
+            return
+        client = getattr(self.ctx, "client", None)
+        method = getattr(client, "flag_conversation", None)
+        conversation_id = self._conversation_id
+        participant = self._recipient
+        self._action_inflight = True
+        self._sync_action_buttons()
+
+        def work() -> None:
+            error = ""
+            try:
+                method(conversation_id, participant)
+            except Exception as exc:  # noqa: BLE001
+                error = describe_error(exc)
+            try:
+                GLib.idle_add(self._finish_flag, error)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="msg-flag").start()
+        except Exception as exc:  # noqa: BLE001
+            self._finish_flag(describe_error(exc))
+
+    def _finish_flag(self, error: str) -> bool:
+        self._action_inflight = False
+        try:
+            if self._destroyed:
+                return False
+            self._sync_action_buttons()
+            if error:
+                self._toast(f"Couldn't report the conversation: {error}")
+            else:
+                self._toast("Reported")
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _toast(self, message: str) -> None:
+        try:
+            self.ctx.toast(message)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _build_loading_page(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
@@ -2759,6 +3020,7 @@ class MessagingPage(Gtk.Box):
         self.conversation_page = page
         try:
             page.on_read = lambda conv=conversation: self._refresh_conversation(conv)
+            page.on_deleted = lambda conv=conversation: self._conversation_deleted(conv)
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -2922,6 +3184,16 @@ class MessagingPage(Gtk.Box):
                 tab.refresh_conversation(conversation)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _conversation_deleted(self, conversation) -> None:
+        """Drop a deleted conversation from both lists and leave the thread."""
+        for tab in (self.inbox_tab, self.requests_tab):
+            try:
+                tab.remove_conversation(conversation)
+            except Exception:  # noqa: BLE001
+                pass
+        self._close_conversation()
+        self._toast("Conversation deleted")
 
     def _on_tab_changed(self, *_args) -> None:
         tab = self.active_tab()

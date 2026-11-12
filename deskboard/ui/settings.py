@@ -109,6 +109,15 @@ class SettingsWindow(Adw.PreferencesWindow):
         self._blog_checks: dict[str, Gtk.Image] = {}
         self._blog_setting_rows: dict[str, tuple[Adw.ActionRow, Gtk.Label, Gtk.Button]] = {}
         self._group_widgets: dict[int, list[Gtk.Widget]] = {}
+        self._blog_form_enabled = False
+        self._blog_save_busy = False
+        self._syncing_blog_form = False
+        self._blog_settings_original: dict[str, object] = {}
+        self._blog_domain_value = None
+        self._syncing_user_settings = False
+        self._user_setting_values: dict[str, bool] = {}
+        self._user_setting_switches: dict[str, Adw.SwitchRow] = {}
+        self._user_setting_busy: set[str] = set()
         try:
             self.set_default_size(680, 760)
         except Exception:  # noqa: BLE001
@@ -409,7 +418,7 @@ class SettingsWindow(Adw.PreferencesWindow):
             self._refresh_blog_settings_model()
         return False
 
-    # -- blog settings (read-only) ----------------------------------------- #
+    # -- blog settings (editable) ----------------------------------------- #
     def _build_blog_settings(self) -> None:
         page = Adw.PreferencesPage()
         page.set_title("Blog settings")
@@ -420,7 +429,7 @@ class SettingsWindow(Adw.PreferencesWindow):
         self.blog_settings_selector_group.set_title("Blog")
         self.blog_settings_selector = Adw.ComboRow()
         self.blog_settings_selector.set_title("Choose a blog")
-        self.blog_settings_selector.set_subtitle("Read-only blog configuration")
+        self.blog_settings_selector.set_subtitle("Edit the fields Tumblr exposes here")
         self.blog_settings_selector.connect(
             "notify::selected", self._on_blog_settings_selected
         )
@@ -430,20 +439,53 @@ class SettingsWindow(Adw.PreferencesWindow):
         self.blog_settings_group = Adw.PreferencesGroup()
         self.blog_settings_group.set_title("Settings")
         self.blog_settings_group.set_description(
-            "Read-only for now — editing needs the next phase "
-            "(write route not verified)."
+            "Changes save to Tumblr. Only changed fields are sent; the custom "
+            "domain remains read-only here."
         )
         page.add(self.blog_settings_group)
-        for key, title, multiline in (
-            ("name", "Name", False),
-            ("title", "Title", False),
-            ("description", "Description", True),
-            ("cname", "Custom domain", False),
-            ("truncateRssFeed", "RSS truncation", False),
-        ):
-            self._blog_setting_rows[key] = self._add_value_row(
-                self.blog_settings_group, title, "—", multiline=multiline
-            )
+
+        self.blog_name_row = Adw.EntryRow(title="Name")
+        self.blog_name_row.connect("changed", self._on_blog_form_changed)
+        self.blog_settings_group.add(self.blog_name_row)
+        self.blog_title_row = Adw.EntryRow(title="Title")
+        self.blog_title_row.connect("changed", self._on_blog_form_changed)
+        self.blog_settings_group.add(self.blog_title_row)
+        self.blog_description_row = Adw.EntryRow(title="Description")
+        self.blog_description_row.connect("changed", self._on_blog_form_changed)
+        self.blog_settings_group.add(self.blog_description_row)
+
+        self.blog_truncate_row = Adw.SwitchRow()
+        self.blog_truncate_row.set_title("Truncate RSS feed")
+        self.blog_truncate_row.set_subtitle(
+            "Publish only an excerpt in the blog's RSS feed"
+        )
+        self.blog_truncate_row.connect("notify::active", self._on_blog_truncate_changed)
+        self.blog_settings_group.add(self.blog_truncate_row)
+
+        self._blog_domain_entry = self._add_value_row(
+            self.blog_settings_group, "Custom domain", "—"
+        )
+
+        self.blog_save_row = Adw.ActionRow()
+        self.blog_save_row.set_title("Save changes")
+        self.blog_save_row.set_subtitle("Only changed fields are sent.")
+        self.blog_save_button = Gtk.Button(label="Save")
+        self.blog_save_button.add_css_class("suggested-action")
+        self.blog_save_button.set_valign(Gtk.Align.CENTER)
+        self.blog_save_button.set_sensitive(False)
+        self.blog_save_button.connect("clicked", lambda *_args: self._save_blog_settings())
+        self.blog_save_row.add_suffix(self.blog_save_button)
+        self.blog_settings_group.add(self.blog_save_row)
+
+        self.blog_save_error_row = Adw.ActionRow()
+        self.blog_save_error_row.set_title("Couldn't save blog settings")
+        retry = Gtk.Button(label="Retry")
+        retry.add_css_class("flat")
+        retry.set_valign(Gtk.Align.CENTER)
+        retry.connect("clicked", lambda *_args: self._save_blog_settings())
+        self.blog_save_error_row.add_suffix(retry)
+        self.blog_save_error_row.set_visible(False)
+        self.blog_settings_group.add(self.blog_save_error_row)
 
         self.blog_settings_error_group = Adw.PreferencesGroup()
         self.blog_settings_error_row = Adw.ActionRow()
@@ -478,7 +520,6 @@ class SettingsWindow(Adw.PreferencesWindow):
             self._show_blog_settings_unavailable(
                 "No blogs on this account",
                 "Sign in to inspect your blog settings.",
-                retry=False,
             )
             return
         self._syncing_blog_selector = True
@@ -499,7 +540,6 @@ class SettingsWindow(Adw.PreferencesWindow):
             self._show_blog_settings_unavailable(
                 "Not available in demo mode",
                 "Blog settings need a signed-in Tumblr session.",
-                retry=False,
             )
             return
         self.blog_settings_selector_group.set_visible(True)
@@ -512,13 +552,68 @@ class SettingsWindow(Adw.PreferencesWindow):
             return
         self._load_blog_settings()
 
-    def _show_blog_settings_unavailable(self, title: str, body: str, *, retry: bool) -> None:
+    def _show_blog_settings_unavailable(self, title: str, body: str) -> None:
         self.blog_settings_error_group.set_visible(False)
         self.blog_settings_unavailable_row.set_title(title)
         self.blog_settings_unavailable_row.set_subtitle(body)
         self.blog_settings_unavailable_group.set_visible(True)
-        for key, (row, label, copy) in self._blog_setting_rows.items():
-            self._set_value(label, copy, "—")
+        self._set_blog_form_enabled(False)
+
+    def _set_blog_form_enabled(self, enabled: bool) -> None:
+        self._blog_form_enabled = bool(enabled)
+        for row in (self.blog_name_row, self.blog_title_row, self.blog_description_row):
+            try:
+                row.set_sensitive(bool(enabled))
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            if self.blog_truncate_row.get_visible():
+                self.blog_truncate_row.set_sensitive(bool(enabled))
+        except Exception:  # noqa: BLE001
+            pass
+        self._sync_blog_save()
+
+    def _on_blog_form_changed(self, *_args) -> None:
+        if self._syncing_blog_form:
+            return
+        self._sync_blog_save()
+
+    def _on_blog_truncate_changed(self, *_args) -> None:
+        if self._syncing_blog_form:
+            return
+        self._sync_blog_save()
+
+    def _collect_blog_changes(self) -> dict:
+        original = self._blog_settings_original
+        changes: dict = {}
+        try:
+            name = self.blog_name_row.get_text().strip()
+            if name != str(original.get("name", "")):
+                changes["name"] = name
+            title = self.blog_title_row.get_text().strip()
+            if title != str(original.get("title", "")):
+                changes["title"] = title
+            description = self.blog_description_row.get_text().strip()
+            if description != str(original.get("description", "")):
+                changes["description"] = description
+            if "truncateRssFeed" in original:
+                paused = bool(self.blog_truncate_row.get_active())
+                if paused != bool(original.get("truncateRssFeed")):
+                    changes["truncateRssFeed"] = paused
+        except Exception:  # noqa: BLE001
+            pass
+        return changes
+
+    def _sync_blog_save(self) -> None:
+        try:
+            enabled = (
+                self._blog_form_enabled
+                and not self._blog_save_busy
+                and bool(self._collect_blog_changes())
+            )
+            self.blog_save_button.set_sensitive(enabled)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _load_blog_settings(self) -> None:
         if bool(getattr(self.ctx, "demo", False)):
@@ -535,8 +630,8 @@ class SettingsWindow(Adw.PreferencesWindow):
         self.blog_settings_error_group.set_visible(False)
         self.blog_settings_unavailable_group.set_visible(False)
         self.blog_settings_group.set_visible(True)
-        for _key, (_row, label, copy) in self._blog_setting_rows.items():
-            self._set_value(label, copy, "Loading…")
+        self.blog_save_error_row.set_visible(False)
+        self._set_blog_form_enabled(False)
         client = self.ctx.client
 
         def work() -> None:
@@ -562,25 +657,107 @@ class SettingsWindow(Adw.PreferencesWindow):
         if error:
             self.blog_settings_error_row.set_subtitle(error)
             self.blog_settings_error_group.set_visible(True)
-            self.blog_settings_group.set_visible(False)
+            self.blog_settings_group.set_visible(True)
+            self._set_blog_form_enabled(False)
             return False
         self.blog_settings_error_group.set_visible(False)
         self.blog_settings_unavailable_group.set_visible(False)
         self.blog_settings_group.set_visible(True)
+        self.blog_save_error_row.set_visible(False)
         data = settings if isinstance(settings, dict) else {}
         values = {
             "name": data.get("name") or name,
-            "title": data.get("title"),
-            "description": data.get("description"),
-            "cname": data.get("cname"),
-            "truncateRssFeed": data.get("truncateRssFeed"),
+            "title": data.get("title") or "",
+            "description": data.get("description") or "",
         }
-        for key, value in values.items():
-            entry = self._blog_setting_rows.get(key)
-            if entry is None:
-                continue
-            row, label, copy = entry
-            self._set_value(label, copy, value)
+        self._syncing_blog_form = True
+        try:
+            self.blog_name_row.set_text(str(values["name"]))
+            self.blog_title_row.set_text(str(values["title"]))
+            self.blog_description_row.set_text(str(values["description"]))
+            truncate = data.get("truncateRssFeed")
+            has_bool = isinstance(truncate, bool)
+            self.blog_truncate_row.set_visible(bool(has_bool))
+            if has_bool:
+                self.blog_truncate_row.set_active(bool(truncate))
+            self._blog_settings_original = {
+                "name": str(values["name"]).strip(),
+                "title": str(values["title"]).strip(),
+                "description": str(values["description"]).strip(),
+            }
+            if has_bool:
+                self._blog_settings_original["truncateRssFeed"] = bool(truncate)
+            self._blog_domain_value = data.get("cname")
+            _row, label, copy = self._blog_domain_entry
+            self._set_value(label, copy, self._blog_domain_value)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self._syncing_blog_form = False
+        self._set_blog_form_enabled(True)
+        self._sync_blog_save()
+        return False
+
+    def _save_blog_settings(self) -> None:
+        if self._blog_save_busy or not self._blog_form_enabled:
+            return
+        changes = self._collect_blog_changes()
+        if not changes:
+            self._sync_blog_save()
+            return
+        if bool(getattr(self.ctx, "demo", False)):
+            self.ctx.toast("Demo mode: blog settings are not saved.")
+            return
+        if not self.ctx.is_signed_in:
+            self.ctx.toast("Sign in to edit blog settings.")
+            return
+        try:
+            index = int(self.blog_settings_selector.get_selected())
+        except (TypeError, ValueError):
+            index = 0
+        if not (0 <= index < len(self._blog_names)):
+            return
+        name = self._blog_names[index]
+        self._blog_save_busy = True
+        self.blog_save_error_row.set_visible(False)
+        self._set_blog_form_enabled(False)
+        self.blog_settings_selector.set_sensitive(False)
+        self.blog_save_button.set_sensitive(False)
+        client = self.ctx.client
+
+        def work() -> None:
+            error = ""
+            result = {}
+            try:
+                result = client.update_blog_settings(name, **changes)
+            except Exception as exc:  # noqa: BLE001
+                error = " ".join(str(exc).split()) or "Tumblr refused the request."
+            try:
+                GLib.idle_add(self._finish_save_blog_settings, name, changes, error, result)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="settings-blog-save").start()
+        except Exception as exc:  # noqa: BLE001
+            self._finish_save_blog_settings(name, changes, str(exc), {})
+
+    def _finish_save_blog_settings(self, name: str, changes: dict, error: str, result) -> bool:
+        self._blog_save_busy = False
+        try:
+            self.blog_settings_selector.set_sensitive(True)
+            if error:
+                self._set_blog_form_enabled(True)
+                self.blog_save_error_row.set_subtitle(error)
+                self.blog_save_error_row.set_visible(True)
+                self._sync_blog_save()
+                self.ctx.toast(f"Couldn't save blog settings: {error}")
+                return False
+            self.ctx.toast("Blog settings saved")
+            self._load_blog_infos()
+            self._load_blog_settings()
+        except Exception:  # noqa: BLE001
+            pass
         return False
 
     # -- account ----------------------------------------------------------- #
@@ -797,8 +974,8 @@ class SettingsWindow(Adw.PreferencesWindow):
         self.user_settings_group = Adw.PreferencesGroup()
         self.user_settings_group.set_title("Tumblr account")
         self.user_settings_group.set_description(
-            "Read-only for now — editing these settings needs a future "
-            "verified write endpoint."
+            "Boolean settings save as you toggle them. Language and email "
+            "remain read-only."
         )
         page.add(self.user_settings_group)
         self.add(page)
@@ -870,28 +1047,38 @@ class SettingsWindow(Adw.PreferencesWindow):
             row.add_suffix(retry)
             return False
         values = data if isinstance(data, dict) else {}
-        language = values.get("language")
-        email = values.get("email")
+        self._user_setting_values = {}
+        self._user_setting_switches = {}
         added = 0
         for key, title in (("language", "Language"), ("email", "Email")):
             value = values.get(key)
             if isinstance(value, str) and value:
                 self._add_value_row(self.user_settings_group, title, value)
                 added += 1
-        for key in sorted(values):
-            if key in ("language", "email"):
-                continue
-            value = values.get(key)
-            if not isinstance(value, bool):
-                continue
-            switch = Adw.SwitchRow()
-            switch.set_title(_humanize(str(key)))
-            switch.set_subtitle("Tumblr account setting (read-only)")
-            switch.set_active(bool(value))
-            switch.set_sensitive(False)
-            self.user_settings_group.add(switch)
-            self._remember_widget(self.user_settings_group, switch)
-            added += 1
+        self._syncing_user_settings = True
+        try:
+            for key in sorted(values):
+                if key in ("language", "email"):
+                    continue
+                value = values.get(key)
+                if not isinstance(value, bool):
+                    continue
+                switch = Adw.SwitchRow()
+                switch.set_title(_humanize(str(key)))
+                switch.set_subtitle("Saves immediately to Tumblr")
+                switch.set_active(bool(value))
+                switch.set_sensitive(True)
+                switch.connect(
+                    "notify::active",
+                    lambda row, _pspec, k=str(key), w=switch: self._on_user_setting_toggled(k, w),
+                )
+                self.user_settings_group.add(switch)
+                self._remember_widget(self.user_settings_group, switch)
+                self._user_setting_values[str(key)] = bool(value)
+                self._user_setting_switches[str(key)] = switch
+                added += 1
+        finally:
+            self._syncing_user_settings = False
         if not added:
             self._add_status_row(
                 self.user_settings_group,
@@ -899,13 +1086,88 @@ class SettingsWindow(Adw.PreferencesWindow):
                 "Tumblr answered without any displayable values.",
             )
         note = Adw.ActionRow()
-        note.set_title("Read-only")
-        note.set_subtitle(
-            "Editing account settings needs the next write-auth phase."
-        )
+        note.set_title("Language and email are read-only")
+        note.set_subtitle("Email changes need Tumblr's verification flow.")
         note.add_css_class("dim-label")
         self.user_settings_group.add(note)
         self._remember_widget(self.user_settings_group, note)
+        return False
+
+    def _on_user_setting_toggled(self, key: str, switch: Adw.SwitchRow) -> None:
+        if self._syncing_user_settings:
+            return
+        key = str(key)
+        try:
+            value = bool(switch.get_active())
+        except Exception:  # noqa: BLE001
+            return
+        original = bool(self._user_setting_values.get(key, value))
+        if value == original:
+            return
+        demo = bool(getattr(self.ctx, "demo", False))
+        try:
+            signed_in = bool(self.ctx.is_signed_in)
+        except Exception:  # noqa: BLE001
+            signed_in = False
+        if demo or not signed_in or key in self._user_setting_busy:
+            self._revert_user_setting(key, switch)
+            if demo:
+                self.ctx.toast("Demo mode: account settings are not saved.")
+            return
+        self._user_setting_busy.add(key)
+        try:
+            switch.set_sensitive(False)
+        except Exception:  # noqa: BLE001
+            pass
+        generation = self._user_settings_generation
+        client = self.ctx.client
+
+        def work() -> None:
+            error = ""
+            try:
+                client.update_user_settings(**{key: value})
+            except Exception as exc:  # noqa: BLE001
+                error = " ".join(str(exc).split()) or "Tumblr refused the request."
+            try:
+                GLib.idle_add(
+                    self._finish_user_setting, generation, key, value, switch, error
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="settings-user-save").start()
+        except Exception as exc:  # noqa: BLE001
+            self._finish_user_setting(generation, key, value, switch, str(exc))
+
+    def _revert_user_setting(self, key: str, switch: Adw.SwitchRow) -> None:
+        try:
+            self._syncing_user_settings = True
+            switch.set_active(bool(self._user_setting_values.get(key, False)))
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self._syncing_user_settings = False
+        try:
+            switch.set_sensitive(True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _finish_user_setting(self, generation: int, key: str, value: bool,
+                             switch: Adw.SwitchRow, error: str) -> bool:
+        self._user_setting_busy.discard(key)
+        if generation != self._user_settings_generation:
+            return False
+        try:
+            if error:
+                self._revert_user_setting(key, switch)
+                self.ctx.toast(f"Couldn't update {_humanize(key)}: {error}")
+            else:
+                self._user_setting_values[key] = bool(value)
+                switch.set_sensitive(True)
+                self.ctx.toast(f"Saved {_humanize(key)}")
+        except Exception:  # noqa: BLE001
+            pass
         return False
 
     # -- appearance -------------------------------------------------------- #

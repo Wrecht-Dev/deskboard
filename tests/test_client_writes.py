@@ -349,6 +349,36 @@ def test_read_paths_never_call_write_methods(monkeypatch):
         "unfollow",
         "mark_conversation_read",
         "create_post",
+        "delete_note",
+        "flag_note",
+        "delete_reply",
+        "mute_post",
+        "unmute_post",
+        "delete_post",
+        "set_post_state",
+        "edit_post",
+        "pin_post",
+        "unpin_post",
+        "block_blog",
+        "unblock_blog",
+        "report",
+        "vote_poll",
+        "follow_tag",
+        "unfollow_tag",
+        "subscribe_blog",
+        "unsubscribe_blog",
+        "subscribe_post",
+        "unsubscribe_post",
+        "set_queue_paused",
+        "shuffle_queue",
+        "reorder_queue",
+        "delete_submission",
+        "delete_inbox_submissions",
+        "mark_activity_read",
+        "delete_conversation",
+        "flag_conversation",
+        "update_blog_settings",
+        "update_user_settings",
         "upload_image",
         "upload_audio",
     ):
@@ -357,6 +387,8 @@ def test_read_paths_never_call_write_methods(monkeypatch):
     # Every read method in the current client surface.
     assert client.get_dashboard().posts == []
     assert client.get_home().posts == []
+    assert client.get_explore().posts == []
+    assert client.get_trending_tags() == []
     assert client.get_blog_posts("staff").posts == []
     assert client.get_blog_info("staff").name == ""
     assert client.get_likes().posts == []
@@ -378,3 +410,4 @@ def test_read_paths_never_call_write_methods(monkeypatch):
     assert client.get_gif_popular() == ([], None)
     assert client.get_blog_settings("staff") == {}
     assert client.get_user_settings() == {}
+    assert client.mention_suggestions("prefix") == []

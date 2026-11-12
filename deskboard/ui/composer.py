@@ -7,6 +7,7 @@ mode every write path is inert and says so.
 from __future__ import annotations
 
 import datetime
+import re
 import threading
 
 import gi
@@ -51,6 +52,12 @@ class ComposerWindow(Adw.Window):
         self._publish_on: str | None = None
         self._discard_dialog = None
         self._blogs = self._collect_blogs()
+        self._mention_popover = None
+        self._mention_timeout = 0
+        self._mention_generation = 0
+        self._mention_prefix = ""
+        self._mention_start = None
+        self._mention_view = None
 
         self.set_title("New post")
         try:
@@ -203,6 +210,13 @@ class ComposerWindow(Adw.Window):
         self.stack.add_titled(link_page, "link", "Link")
         self.stack.set_visible_child_name("text")
         content.append(self.stack)
+        for view in (self.text_view, self.quote_view, self.link_commentary):
+            try:
+                view.get_buffer().connect(
+                    "changed", lambda buffer, v=view: self._on_mention_changed(buffer, v)
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         tags_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         tags_label = Gtk.Label(label="Tags")
@@ -516,6 +530,15 @@ class ComposerWindow(Adw.Window):
                 return True
             if keyval == Gdk.KEY_Escape:
                 try:
+                    if (
+                        self._mention_popover is not None
+                        and self._mention_popover.get_visible()
+                    ):
+                        self._hide_mentions()
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
                     if self.schedule_popover is not None and self.schedule_popover.get_visible():
                         self.schedule_popover.popdown()
                         return True
@@ -526,6 +549,188 @@ class ComposerWindow(Adw.Window):
         except Exception:  # noqa: BLE001
             pass
         return False
+
+    # -- mention autocomplete ---------------------------------------------- #
+    def _on_mention_changed(self, buffer, view: Gtk.TextView) -> None:
+        try:
+            if not view.get_mapped():
+                return
+            insert = buffer.get_iter_at_mark(buffer.get_insert())
+            offset = int(insert.get_offset())
+            text = buffer.get_text(
+                buffer.get_start_iter(), buffer.get_end_iter(), True
+            )
+            snippet = text[:offset]
+            match = re.search(r"(?:^|[\s(])@([A-Za-z0-9-]*)$", snippet)
+            if not match:
+                self._hide_mentions()
+                return
+            prefix = str(match.group(1) or "")
+            start = offset - len(prefix) - 1
+            if (
+                self._mention_view is view
+                and self._mention_prefix == prefix
+                and self._mention_popover is not None
+                and self._mention_popover.get_visible()
+            ):
+                return
+            self._mention_view = view
+            self._mention_start = start
+            self._mention_prefix = prefix
+            self._schedule_mentions(prefix)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _schedule_mentions(self, prefix: str) -> None:
+        self._mention_generation += 1
+        generation = self._mention_generation
+        if self._mention_timeout:
+            try:
+                GLib.source_remove(self._mention_timeout)
+            except Exception:  # noqa: BLE001
+                pass
+            self._mention_timeout = 0
+        try:
+            self._mention_timeout = GLib.timeout_add(
+                260, self._request_mentions, generation, prefix
+            )
+        except Exception:  # noqa: BLE001
+            self._mention_timeout = 0
+
+    def _request_mentions(self, generation: int, prefix: str) -> bool:
+        self._mention_timeout = 0
+        if generation != self._mention_generation:
+            return False
+        if bool(getattr(self.ctx, "demo", False)):
+            return False
+        try:
+            if not self.ctx.is_signed_in:
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        client = self.ctx.client
+        getter = getattr(client, "mention_suggestions", None)
+        if not callable(getter):
+            return False
+
+        def work() -> None:
+            suggestions: list = []
+            try:
+                suggestions = list(getter(prefix) or [])
+            except Exception:  # noqa: BLE001 - autocomplete is best-effort
+                suggestions = []
+            try:
+                GLib.idle_add(self._apply_mentions, generation, prefix, suggestions)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="mentions").start()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _apply_mentions(self, generation: int, prefix: str, suggestions: list) -> bool:
+        if generation != self._mention_generation or prefix != self._mention_prefix:
+            return False
+        view = self._mention_view
+        if view is None or not view.get_mapped():
+            return False
+        blogs = []
+        for item in suggestions:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name and name not in [entry[0] for entry in blogs]:
+                blogs.append((name, str(item.get("title") or "")))
+        if not blogs:
+            self._hide_mentions()
+            return False
+        self._hide_mentions(keep_context=True)
+        try:
+            popover = Gtk.Popover()
+            popover.set_has_arrow(False)
+            popover.set_autohide(True)
+            popover.set_parent(view)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.set_margin_start(8)
+            box.set_margin_end(8)
+            box.set_margin_top(8)
+            box.set_margin_bottom(8)
+            heading = Gtk.Label(label="Mention a blog", xalign=0)
+            heading.add_css_class("caption")
+            heading.add_css_class("dim-label")
+            box.append(heading)
+            for name, title in blogs[:6]:
+                button = Gtk.Button(label=f"@{name}")
+                button.add_css_class("flat")
+                button.set_halign(Gtk.Align.FILL)
+                if title:
+                    button.set_tooltip_text(title)
+                button.connect(
+                    "clicked", lambda _button, n=name: self._insert_mention(n)
+                )
+                box.append(button)
+            popover.set_child(box)
+            popover.connect("closed", lambda *_args: self._on_mention_closed(popover))
+            self._mention_popover = popover
+            popover.popup()
+        except Exception:  # noqa: BLE001
+            self._mention_popover = None
+        return False
+
+    def _on_mention_closed(self, popover) -> None:
+        if self._mention_popover is popover:
+            self._mention_popover = None
+        try:
+            popover.unparent()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _hide_mentions(self, keep_context: bool = False) -> None:
+        popover = self._mention_popover
+        self._mention_popover = None
+        if popover is not None:
+            try:
+                popover.popdown()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                popover.unparent()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._mention_timeout:
+            try:
+                GLib.source_remove(self._mention_timeout)
+            except Exception:  # noqa: BLE001
+                pass
+            self._mention_timeout = 0
+        if not keep_context:
+            self._mention_generation += 1
+            self._mention_prefix = ""
+            self._mention_start = None
+            self._mention_view = None
+
+    def _insert_mention(self, name: str) -> None:
+        view = self._mention_view
+        start = self._mention_start
+        prefix = self._mention_prefix
+        if view is None or start is None:
+            self._hide_mentions()
+            return
+        try:
+            buffer = view.get_buffer()
+            begin = buffer.get_iter_at_offset(int(start))
+            end = buffer.get_iter_at_offset(int(start) + 1 + len(prefix))
+            buffer.begin_user_action()
+            buffer.delete(begin, end)
+            begin = buffer.get_iter_at_offset(int(start))
+            buffer.insert(begin, f"@{name}")
+            buffer.end_user_action()
+            view.grab_focus()
+        except Exception:  # noqa: BLE001
+            pass
+        self._hide_mentions()
 
     # -- scheduling -------------------------------------------------------- #
     def _set_schedule(self) -> None:
@@ -725,6 +930,7 @@ class ComposerWindow(Adw.Window):
     def _close_now(self) -> None:
         """Destroy the window (``close()`` would only hide it on Adw.Window)."""
         self._allow_close = True
+        self._hide_mentions()
         self._notify_closed()
 
         def destroy() -> bool:

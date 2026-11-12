@@ -1,7 +1,8 @@
 """Notifications / activity feed.
 
-Owner: shell.  Read-only: rows link to the actor's blog page; no actions are
-sent.  The list uses the same recycling pattern as the post feed.
+Owner: shell.  Rows link to the actor's blog page; opening the page fires the
+one best-effort mark-activity-read request so Tumblr's badge clears.  The list
+uses the same recycling pattern as the post feed.
 """
 from __future__ import annotations
 
@@ -108,6 +109,7 @@ class NotificationsPage(Gtk.Box):
         self._vadj_handler = 0
         self._blog = ""
         self._blog_waiting = False
+        self._marked_read = False
         self._resolve_blog()
 
         self.store = Gio.ListStore(item_type=NotificationItem)
@@ -209,6 +211,31 @@ class NotificationsPage(Gtk.Box):
         self._set_footer(None)
         self._show_state("loading")
         self._load_page(None)
+        self._mark_activity_read()
+
+    def _mark_activity_read(self) -> None:
+        """Clear the activity badge once per page open; failures are ignored."""
+        if self._marked_read:
+            return
+        if bool(getattr(self.ctx, "demo", False)):
+            self._marked_read = True
+            return
+        if not self._blog:
+            return
+        self._marked_read = True
+        client = self.ctx.client
+        blog = self._blog
+
+        def work() -> None:
+            try:
+                client.mark_activity_read(blog)
+            except Exception:  # noqa: BLE001 - badge clearing is best-effort
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="activity-read").start()
+        except Exception:  # noqa: BLE001
+            pass
 
     def cleanup(self) -> None:
         self._generation += 1

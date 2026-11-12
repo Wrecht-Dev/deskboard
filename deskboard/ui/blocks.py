@@ -6,6 +6,7 @@ here is private.  Widget trees are deliberately flat and cheap because a
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
@@ -15,7 +16,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Gdk, Graphene, Gtk, Pango
+from gi.repository import Gdk, GLib, Graphene, Gtk, Pango
 
 from ..models import Block, Media
 from .html import escape_markup, to_pango
@@ -367,11 +368,143 @@ def _render_link(container: Gtk.Box, block: Block, ctx: Any) -> bool:
     return True
 
 
-def _render_poll(container: Gtk.Box, block: Block) -> bool:
+# Local, optimistic poll votes keyed by poll id.  Cleared when the server
+# reports visible counts for the poll; survives card recycling within a session.
+_POLL_VOTES: dict[str, str] = {}
+_POLL_BUSY: set[str] = set()
+
+
+def _poll_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _poll_rows(block: Block) -> tuple[str, list[dict]]:
     data = block.data if isinstance(block.data, dict) else {}
+    poll_id = str(data.get("clientId") or data.get("pollId") or data.get("id") or "")
+    raw = data.get("answers")
+    rows: list[dict] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                rows.append({"client_id": "", "text": item, "votes": 0, "percent": None})
+                continue
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("answerText") or item.get("answer_text")
+                       or item.get("text") or "").strip()
+            if not text:
+                continue
+            percent = None
+            for key in ("percentage", "percent", "percentageOfVotes"):
+                if isinstance(item.get(key), (int, float)):
+                    percent = float(item[key])
+                    break
+            rows.append({
+                "client_id": str(item.get("clientId") or item.get("answerId")
+                                 or item.get("id") or ""),
+                "text": text,
+                "votes": _poll_int(item.get("answerCount") or item.get("answer_count")
+                                   or item.get("voteCount") or item.get("votes")),
+                "percent": percent,
+            })
+    if not rows:
+        for text, votes in block.answers:
+            rows.append({"client_id": "", "text": text, "votes": votes, "percent": None})
+    return poll_id, rows
+
+
+def _poll_can_vote(ctx: Any) -> bool:
+    if ctx is None or getattr(ctx, "demo", False):
+        return False
+    try:
+        return bool(getattr(ctx, "is_signed_in", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _poll_toast(ctx: Any, message: str) -> None:
+    try:
+        ctx.toast(message)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _submit_poll_vote(ctx: Any, poll_id: str, selection: str,
+                      refresh: Callable[[], None]) -> None:
+    if not poll_id or not selection or poll_id in _POLL_BUSY:
+        return
+    client = getattr(ctx, "client", None)
+    vote = getattr(client, "vote_poll", None)
+    if not callable(vote):
+        return
+    _POLL_BUSY.add(poll_id)
+    previous = _POLL_VOTES.get(poll_id)
+    _POLL_VOTES[poll_id] = selection
+    try:
+        refresh()
+    except Exception:  # noqa: BLE001
+        pass
+
+    def work() -> None:
+        error = ""
+        try:
+            vote(poll_id, selection)
+        except Exception as exc:  # noqa: BLE001 - surfaced as a toast
+            error = " ".join(str(exc or "").split()) or exc.__class__.__name__
+
+        def finish() -> bool:
+            _POLL_BUSY.discard(poll_id)
+            if error:
+                if previous is None:
+                    _POLL_VOTES.pop(poll_id, None)
+                else:
+                    _POLL_VOTES[poll_id] = previous
+            try:
+                refresh()
+            except Exception:  # noqa: BLE001
+                pass
+            if error:
+                _poll_toast(ctx, f"Couldn't vote: {error}")
+            else:
+                _poll_toast(ctx, "Vote counted")
+            return False
+
+        try:
+            GLib.idle_add(finish)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        threading.Thread(target=work, daemon=True, name="poll-vote").start()
+    except Exception as exc:  # noqa: BLE001
+        _POLL_BUSY.discard(poll_id)
+        _POLL_VOTES.pop(poll_id, None)
+        try:
+            refresh()
+        except Exception:  # noqa: BLE001
+            pass
+        _poll_toast(ctx, f"Couldn't vote: {exc}")
+
+
+def _clear_box(box: Gtk.Box) -> None:
+    child = box.get_first_child()
+    while child is not None:
+        nxt = child.get_next_sibling()
+        try:
+            box.remove(child)
+        except Exception:  # noqa: BLE001
+            pass
+        child = nxt
+
+
+def _render_poll(container: Gtk.Box, block: Block, ctx: Any = None,
+                 post: Any = None) -> bool:
     question = block.question.strip()
-    answers = block.answers
-    if not question and not answers:
+    poll_id, rows = _poll_rows(block)
+    if not question and not rows:
         return False
 
     card = _box(spacing=0)
@@ -393,51 +526,120 @@ def _render_poll(container: Gtk.Box, block: Block) -> bool:
     body.set_margin_bottom(12)
     body.set_margin_start(14)
     body.set_margin_end(14)
-
-    raw_answers = data.get("answers") if isinstance(data.get("answers"), list) else []
-    total_votes = sum(int(votes) for _text, votes in answers)
-    for index, (answer_text, votes) in enumerate(answers):
-        if not answer_text.strip():
-            continue
-        raw = raw_answers[index] if index < len(raw_answers) else None
-        percent = None
-        if isinstance(raw, dict):
-            for key in ("percentage", "percent", "percentageOfVotes"):
-                if isinstance(raw.get(key), (int, float)):
-                    percent = float(raw[key])
-                    break
-        if percent is None and total_votes > 0:
-            percent = votes * 100.0 / total_votes
-        fraction = max(0.0, min(1.0, (percent or 0.0) / 100.0))
-
-        row = _box(spacing=4)
-        label_row = _box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        label_row.append(_label(escape_markup(answer_text), selectable=True))
-        detail = ""
-        if percent is not None:
-            detail = f"{percent:.0f}%"
-        if votes:
-            detail = f"{detail} · {votes}" if detail else str(votes)
-        if detail:
-            count = _label(escape_markup(detail), wrap=False, css=("caption", "dim-label"))
-            count.set_hexpand(False)
-            label_row.append(count)
-        row.append(label_row)
-
-        bar = Gtk.ProgressBar()
-        bar.set_fraction(fraction)
-        bar.set_show_text(False)
-        bar.set_size_request(-1, 6)
-        row.append(bar)
-        body.append(row)
     card.append(body)
 
-    if total_votes:
-        footer = _label(f"{total_votes} votes", css=("caption", "dim-label"))
-        footer.set_margin_start(14)
-        footer.set_margin_end(14)
-        footer.set_margin_bottom(10)
-        card.append(footer)
+    footer = _box(spacing=2)
+    footer.set_margin_start(14)
+    footer.set_margin_end(14)
+    footer.set_margin_bottom(10)
+    card.append(footer)
+
+    signed_in = _poll_can_vote(ctx)
+    demo = bool(getattr(ctx, "demo", False)) if ctx is not None else False
+    has_ids = bool(poll_id) and all(row["client_id"] for row in rows)
+
+    def current_state() -> tuple[int, str | None]:
+        local = _POLL_VOTES.get(poll_id) if poll_id else None
+        total = sum(row["votes"] for row in rows)
+        if local:
+            total += 1
+        return total, local
+
+    def render() -> None:
+        _clear_box(body)
+        _clear_box(footer)
+        total, local = current_state()
+        no_visible = all(not row["votes"] and row["percent"] is None
+                         for row in rows)
+        selectable = bool(signed_in and not demo and has_ids
+                          and no_visible and total == 0 and not local)
+
+        if selectable:
+            for row in rows:
+                button = Gtk.Button()
+                button.add_css_class("flat")
+                button.add_css_class("poll-option")
+                button.set_halign(Gtk.Align.FILL)
+                content = _box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                content.set_margin_top(2)
+                content.set_margin_bottom(2)
+                radio = Gtk.Image.new_from_icon_name("radio-symbolic")
+                radio.set_pixel_size(16)
+                content.append(radio)
+                text = _label(escape_markup(row["text"]), wrap=True)
+                text.set_valign(Gtk.Align.CENTER)
+                content.append(text)
+                button.set_child(content)
+                button.set_tooltip_text("Vote for this option")
+                button.connect(
+                    "clicked",
+                    lambda _button, choice=row["client_id"]:
+                    _submit_poll_vote(ctx, poll_id, choice, render),
+                )
+                body.append(button)
+            hint = _label("Vote to see the results.",
+                          css=("caption", "dim-label"))
+            footer.append(hint)
+            return
+
+        total = sum(row["votes"] for row in rows)
+        if local:
+            total += 1
+        for row in rows:
+            votes = row["votes"]
+            if local and row["client_id"] == local:
+                votes += 1
+            percent = row["percent"]
+            if percent is None and total > 0:
+                percent = votes * 100.0 / total
+            fraction = max(0.0, min(1.0, (percent or 0.0) / 100.0))
+
+            option = _box(spacing=4)
+            label_row = _box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            if local and row["client_id"] == local:
+                chosen = Gtk.Image.new_from_icon_name("object-select-symbolic")
+                chosen.set_pixel_size(14)
+                chosen.set_valign(Gtk.Align.CENTER)
+                label_row.append(chosen)
+            label_row.append(_label(escape_markup(row["text"]), selectable=True))
+            detail = ""
+            if percent is not None:
+                detail = f"{percent:.0f}%"
+            if votes:
+                detail = f"{detail} · {votes}" if detail else str(votes)
+            if detail:
+                count = _label(escape_markup(detail), wrap=False,
+                               css=("caption", "dim-label"))
+                count.set_hexpand(False)
+                label_row.append(count)
+            option.append(label_row)
+
+            bar = Gtk.ProgressBar()
+            bar.set_fraction(fraction)
+            bar.set_show_text(False)
+            bar.set_size_request(-1, 6)
+            option.append(bar)
+            body.append(option)
+
+        has_results = total > 0 or any(row["percent"] is not None for row in rows)
+        if total > 0:
+            footer.append(_label(f"{total} votes", css=("caption", "dim-label")))
+        elif local:
+            footer.append(_label("Vote counted — results will update shortly.",
+                                 css=("caption", "dim-label")))
+        elif has_results:
+            pass
+        elif demo:
+            footer.append(_label("Demo mode — voting is disabled.",
+                                 css=("caption", "dim-label")))
+        elif not signed_in:
+            footer.append(_label("Sign in to vote.",
+                                 css=("caption", "dim-label")))
+        else:
+            footer.append(_label("Voting isn't available for this poll.",
+                                 css=("caption", "dim-label")))
+
+    render()
     container.append(card)
     return True
 
@@ -681,7 +883,7 @@ def _render(container: Gtk.Box, blocks: Iterable[Block], ctx: Any, post: Any,
                 continue
 
         if block_type == "poll":
-            if _render_poll(container, block):
+            if _render_poll(container, block, ctx, post):
                 ordered_counts.clear()
                 index += 1
                 continue

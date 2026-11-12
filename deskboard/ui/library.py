@@ -1,12 +1,12 @@
-"""Inbox, drafts and queue: three read-only post lists.
+"""Inbox, drafts and queue post lists.
 
-Owner: messaging.
+Owner: messaging (Queue controls added by shell).
 
-All three are the same widget with a different loader: a recycled
-``Gtk.ListView`` of :class:`~deskboard.ui.postcard.PostCard` rows, a small count
-strip, pagination through ``Page.next_url`` and an inline retry state.  Nothing
-here edits, publishes or deletes anything — that is Phase 3 — so the only
-mutation a page can cause is fetching its own next page.
+All three share a recycled ``Gtk.ListView`` of
+:class:`~deskboard.ui.postcard.PostCard` rows, a count strip, pagination
+through ``Page.next_url`` and inline retry states.  Inbox and Drafts are
+read-only.  Queue adds explicit Pause/Resume and Shuffle actions; nothing here
+edits, publishes or deletes without a user click.
 """
 from __future__ import annotations
 
@@ -805,6 +805,8 @@ class DraftsPage(_PostListPage):
 
     def __init__(self, ctx, blog) -> None:
         self.blog = str(blog or "").strip()
+        self._queue_paused = False
+        self._queue_busy = False
         target = self.blog
         if target:
             loader = lambda: ctx.client.get_drafts(target, limit=20)  # noqa: E731
@@ -847,6 +849,8 @@ class QueuePage(_PostListPage):
 
     def __init__(self, ctx, blog) -> None:
         self.blog = str(blog or "").strip()
+        self._queue_paused = False
+        self._queue_busy = False
         target = self.blog
         if target:
             loader = lambda: ctx.client.get_queue(target, limit=20)  # noqa: E731
@@ -866,14 +870,177 @@ class QueuePage(_PostListPage):
         self._set_notice_text(
             "This queue is paused",
             "Queued posts are not publishing on the usual schedule. "
-            "Unpause from the Tumblr website to resume.",
+            "Resume the queue here when you are ready.",
         )
+        self._sync_queue_buttons()
 
     def _supported(self) -> bool:
         return bool(self.blog) and super()._supported()
 
+    def _build_pagebar(self) -> Gtk.Widget:
+        bar = super()._build_pagebar()
+        controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        controls.set_valign(Gtk.Align.CENTER)
+        self._queue_spinner = Adw.Spinner()
+        self._queue_spinner.set_size_request(16, 16)
+        self._queue_spinner.set_visible(False)
+        controls.append(self._queue_spinner)
+        self._pause_button = Gtk.Button(label="Pause")
+        self._pause_button.add_css_class("flat")
+        self._pause_button.set_valign(Gtk.Align.CENTER)
+        self._pause_button.set_tooltip_text("Pause the queue")
+        self._pause_button.connect("clicked", lambda *_args: self._toggle_queue_paused())
+        controls.append(self._pause_button)
+        self._shuffle_button = Gtk.Button(label="Shuffle")
+        self._shuffle_button.add_css_class("flat")
+        self._shuffle_button.set_valign(Gtk.Align.CENTER)
+        self._shuffle_button.set_tooltip_text("Shuffle the queue order")
+        self._shuffle_button.connect("clicked", lambda *_args: self._shuffle_queue())
+        controls.append(self._shuffle_button)
+        bar.append(controls)
+        return bar
+
     def _apply_notice(self, raw: dict) -> None:
-        self._set_notice_visible(_queue_paused(raw))
+        self._queue_paused = _queue_paused(raw)
+        if self._queue_paused:
+            self._set_notice_text(
+                "This queue is paused",
+                "Queued posts are not publishing on the usual schedule. "
+                "Resume the queue here when you are ready.",
+            )
+        self._set_notice_visible(self._queue_paused)
+        self._sync_queue_buttons()
+
+    def _sync_queue_buttons(self) -> None:
+        try:
+            enabled = (
+                bool(self.blog)
+                and not bool(getattr(self.ctx, "demo", False))
+                and bool(getattr(self.ctx, "is_signed_in", False))
+                and not self._queue_busy
+            )
+            label = "Resume" if self._queue_paused else "Pause"
+            self._pause_button.set_label(label)
+            self._pause_button.set_tooltip_text(
+                "Resume the queue" if self._queue_paused else "Pause the queue"
+            )
+            self._pause_button.set_sensitive(enabled)
+            self._shuffle_button.set_sensitive(enabled)
+            self._queue_spinner.set_visible(self._queue_busy)
+            if bool(getattr(self.ctx, "demo", False)):
+                tip = "Demo mode: queue controls are disabled."
+                self._pause_button.set_tooltip_text(tip)
+                self._shuffle_button.set_tooltip_text(tip)
+            elif not self.blog:
+                tip = "No blog is selected for the queue."
+                self._pause_button.set_tooltip_text(tip)
+                self._shuffle_button.set_tooltip_text(tip)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _queue_action_failed(self, action: str, error: str) -> None:
+        self._queue_busy = False
+        self._sync_queue_buttons()
+        self.ctx.toast(f"Couldn't {action} the queue: {error}")
+
+    def _toggle_queue_paused(self) -> None:
+        if self._queue_busy:
+            return
+        if bool(getattr(self.ctx, "demo", False)):
+            self.ctx.toast("Demo mode: queue controls are disabled.")
+            return
+        if not self.blog:
+            return
+        target = not self._queue_paused
+        self._queue_paused = target
+        self._queue_busy = True
+        self._sync_queue_buttons()
+        self._set_notice_visible(target)
+        client = self.ctx.client
+        blog = self.blog
+
+        def work() -> None:
+            error = ""
+            try:
+                client.set_queue_paused(blog, target)
+            except Exception as exc:  # noqa: BLE001
+                error = describe_error(exc)
+            try:
+                GLib.idle_add(self._finish_queue_pause, target, error)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="queue-pause").start()
+        except Exception as exc:  # noqa: BLE001
+            self._queue_busy = False
+            self._queue_paused = not target
+            self._sync_queue_buttons()
+            self.ctx.toast(f"Couldn't {'pause' if target else 'resume'} the queue: {exc}")
+
+    def _finish_queue_pause(self, target: bool, error: str) -> bool:
+        if self._destroyed:
+            return False
+        self._queue_busy = False
+        if error:
+            self._queue_paused = not target
+            self._sync_queue_buttons()
+            self._set_notice_visible(self._queue_paused)
+            self._queue_action_failed("pause" if target else "resume", error)
+            return False
+        action = "paused" if target else "resumed"
+        try:
+            self.ctx.toast(f"Queue {action}")
+            self._sync_queue_buttons()
+            self.refresh()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _shuffle_queue(self) -> None:
+        if self._queue_busy or not self.blog:
+            return
+        if bool(getattr(self.ctx, "demo", False)):
+            self.ctx.toast("Demo mode: queue controls are disabled.")
+            return
+        self._queue_busy = True
+        self._sync_queue_buttons()
+        client = self.ctx.client
+        blog = self.blog
+
+        def work() -> None:
+            error = ""
+            try:
+                client.shuffle_queue(blog)
+            except Exception as exc:  # noqa: BLE001
+                error = describe_error(exc)
+            try:
+                GLib.idle_add(self._finish_queue_shuffle, error)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="queue-shuffle").start()
+        except Exception as exc:  # noqa: BLE001
+            self._queue_busy = False
+            self._sync_queue_buttons()
+            self.ctx.toast(f"Couldn't shuffle the queue: {exc}")
+
+    def _finish_queue_shuffle(self, error: str) -> bool:
+        if self._destroyed:
+            return False
+        self._queue_busy = False
+        if error:
+            self._sync_queue_buttons()
+            self._queue_action_failed("shuffle", error)
+            return False
+        try:
+            self.ctx.toast("Queue shuffled")
+            self._sync_queue_buttons()
+            self.refresh()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     def _show_unsupported(self) -> None:
         if not self.blog:
