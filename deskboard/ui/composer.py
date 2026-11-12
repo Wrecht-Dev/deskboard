@@ -28,8 +28,9 @@ def _describe_error(error: BaseException) -> str:
 class ComposerWindow(Adw.Window):
     """A writing window for text, quote and link posts.
 
-    Attachments use exactly the dict returned by
-    ``ctx.client.upload_image(path)``; each becomes an NPF image block.
+    Attachments are Tumblr media objects, as delivered by the media tray
+    after it unwraps the ``ctx.client.upload_image`` envelope; each becomes an
+    NPF image block.
     """
 
     __gtype_name__ = "DeskboardComposerWindow"
@@ -351,7 +352,7 @@ class ComposerWindow(Adw.Window):
 
     # -- attachments ------------------------------------------------------- #
     def add_media(self, media: dict) -> None:
-        """Attach one uploaded media dict (``client.upload_image`` result)."""
+        """Attach one Tumblr media object (the attachment tray's ``on_insert``)."""
         if not isinstance(media, dict) or not media:
             self._show_error("That attachment could not be added.")
             return

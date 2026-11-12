@@ -342,7 +342,7 @@ def test_upload_image_builds_multipart_body_and_posts(monkeypatch, tmp_path):
 
     result = client.upload_image(str(image))
 
-    assert result == {"response": {"id": "media-1"}}
+    assert result == {"id": "media-1"}  # client unwraps the {"response": …} envelope
     assert len(seen) == 1
     request = seen[0]
     assert request.full_url == "https://www.tumblr.com/api/v2/media/image"

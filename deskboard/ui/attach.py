@@ -465,6 +465,22 @@ class _GifPickerDialog(Adw.Dialog):
             self._set_status("That's all for now.")
         else:
             self._set_status("")
+        if added:
+            # If the page does not fill the viewport there is nothing to
+            # scroll, so fetch the next offset automatically.
+            GLib.timeout_add(120, self._maybe_fill_view)
+        return False
+
+    def _maybe_fill_view(self) -> bool:
+        if not self._alive or self._loading or self._next_offset is None:
+            return False
+        try:
+            adjustment = self.scroller.get_vadjustment()
+            upper = adjustment.get_upper()
+            if upper > 0 and upper <= adjustment.get_page_size() + 24:
+                self._load_page(self._next_offset)
+        except Exception:  # noqa: BLE001
+            pass
         return False
 
     def _retry(self) -> None:
@@ -528,6 +544,7 @@ class AttachTray(Gtk.Box):
         self._file_dialog: Gtk.FileDialog | None = None
         self._gif_dialog: _GifPickerDialog | None = None
         self._status_timer = 0
+        self._pulse_id = 0
         self.add_css_class("db-attach-tray")
 
         self.image_button = Gtk.Button.new_from_icon_name("insert-image-symbolic")
@@ -552,6 +569,12 @@ class AttachTray(Gtk.Box):
         self.status_label.set_valign(Gtk.Align.CENTER)
         self.status_label.set_visible(False)
         self.append(self.status_label)
+
+        self.progress = Gtk.ProgressBar()
+        self.progress.set_size_request(64, -1)
+        self.progress.set_valign(Gtk.Align.CENTER)
+        self.progress.set_visible(False)
+        self.append(self.progress)
 
     # -- context ----------------------------------------------------------- #
     def set_context(self, ctx: Any) -> None:
@@ -615,8 +638,25 @@ class AttachTray(Gtk.Box):
         try:
             self.image_button.set_sensitive(not busy)
             self.gif_button.set_sensitive(not busy)
+            self.progress.set_visible(busy)
         except Exception:  # noqa: BLE001
             pass
+        if busy:
+            if not self._pulse_id:
+                self._pulse_id = GLib.timeout_add(120, self._pulse_progress)
+        elif self._pulse_id:
+            try:
+                GLib.source_remove(self._pulse_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._pulse_id = 0
+
+    def _pulse_progress(self) -> bool:
+        try:
+            self.progress.pulse()
+        except Exception:  # noqa: BLE001
+            pass
+        return bool(self._busy)
 
     # -- image upload ------------------------------------------------------ #
     def _on_add_image(self) -> None:
@@ -771,4 +811,16 @@ class AttachTray(Gtk.Box):
     # -- Gtk lifecycle ----------------------------------------------------- #
     def do_unroot(self) -> None:
         self._alive = False
+        if self._pulse_id:
+            try:
+                GLib.source_remove(self._pulse_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._pulse_id = 0
+        dialog, self._gif_dialog = self._gif_dialog, None
+        if dialog is not None:
+            try:
+                dialog.close()
+            except Exception:  # noqa: BLE001
+                pass
         Gtk.Widget.do_unroot(self)

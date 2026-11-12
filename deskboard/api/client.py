@@ -557,11 +557,27 @@ class TumblrClient:
 
     # -- media upload (composer) ------------------------------------------- #
     def upload_image(self, path: str) -> dict:
-        """Upload a local image through ``POST /v2/media/image`` (multipart)."""
-        return self._upload("/v2/media/image", path, "image")
+        """Upload a local image and return the Tumblr **media object**.
+
+        The server wraps it in ``{"response": {...}}``; callers get the media
+        object directly (ready for ``{"type": "image", "media": [obj]}``).
+        """
+        return self._media_object("/v2/media/image", path, "image")
 
     def upload_audio(self, path: str) -> dict:
-        return self._upload("/v2/media/audio", path, "audio")
+        return self._media_object("/v2/media/audio", path, "audio")
+
+    def _media_object(self, path: str, file_path: str, field: str) -> dict:
+        data = self._upload(path, file_path, field)
+        if isinstance(data, dict):
+            media = data.get("response", data)
+            if isinstance(media, dict):
+                # some responses nest again under "media"
+                inner = media.get("media")
+                if isinstance(inner, dict):
+                    return inner
+                return media
+        return {}
 
     def _upload(self, path: str, file_path: str, field: str) -> dict:
         import mimetypes
