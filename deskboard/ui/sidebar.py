@@ -427,7 +427,7 @@ class Sidebar(Gtk.Box):
 
     # -- "Your tags" ------------------------------------------------------- #
     def _add_your_tags_group(self) -> None:
-        """A capped, scrollable list of every tag the account follows."""
+        """A scrollable list of every tag the account follows."""
         if not self._tags:
             return
         try:
