@@ -21,7 +21,8 @@ deliberately **not** exercised (they mutate the account).
 | Trending tags | `GET /v2/explore/trending/tags` | 🟡 (client ready) |
 | Likes | `GET /v2/user/likes` | ✅ |
 | Followed blogs | `GET /v2/user/following` | ✅ |
-| Followed tags ("Your tags") | `GET /v2/user/tags` | ✅ |
+| Followed tags ("Your tags") | `GET /v2/user/tags` | ✅ sidebar group + **tab** |
+| Your-tags aggregate feed | merges `/v2/hubs/{tag}/timeline` per followed tag | ✅ `FollowedTagsSource` (latest/top, cursor) |
 | **Notifications / activity** | `GET /v2/blog/{blog}/notifications?limit=&before=` | 🟡 |
 | **Conversations (DM list)** | `GET /v2/conversations?limit=&before=` | 🟡 |
 | **Conversation messages** | `GET /v2/conversations/messages?conversation_id=` | 🟡 |

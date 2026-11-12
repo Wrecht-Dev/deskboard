@@ -17,6 +17,7 @@ DASHBOARD = "dashboard"
 LIKES = "likes"
 BLOG = "blog"
 TAGGED = "tagged"
+MYTAGS = "mytags"
 SEARCH = "search"
 FOLLOWING = "following"
 
@@ -97,3 +98,86 @@ class FeedSource:
         value = str(data.get("value") or "")
         sort = str(data.get("sort") or "latest")
         return cls(kind=kind, value=value, sort=sort)
+
+
+class FollowedTagsSource(FeedSource):
+    """A feed built from *all* the tags this account follows.
+
+    Tumblr has no single "posts from my tags" endpoint, so each page pulls the
+    first page of several followed tags concurrently, merges, de-duplicates and
+    orders them the same way a tag page does (newest first for ``latest``, most
+    notes first for ``top``). The cursor is the index of the next tag batch.
+    """
+
+    batch: int = 6
+
+    def __init__(self, kind: str = MYTAGS, sort: str = "latest", title: str = "Your tags", **kwargs) -> None:
+        super().__init__(kind=kind, sort=sort, title=title, icon="tag-symbolic", **kwargs)
+        self._tags: list[str] | None = None
+        self._tags_error: str = ""
+
+    # -- helper ------------------------------------------------------------ #
+    def _followed(self, client) -> list[str]:
+        if self._tags is None:
+            try:
+                self._tags = list(client.get_followed_tags())
+            except Exception as exc:  # noqa: BLE001 - surfaced through the feed
+                self._tags_error = str(exc) or "Could not load your tags."
+                self._tags = []
+        return self._tags
+
+    # -- FeedSource -------------------------------------------------------- #
+    def load(self, client, cursor: str | None = None):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from .client import Page
+
+        tags = self._followed(client)
+        if not tags and self._tags_error:
+            raise RuntimeError(self._tags_error)
+        offset = 0
+        if cursor:
+            import json
+
+            try:
+                offset = int(json.loads(cursor).get("offset", 0))
+            except (TypeError, ValueError):
+                offset = 0
+        if offset >= len(tags):
+            return Page(posts=[], next_url=None)
+        chunk = tags[offset:offset + self.batch]
+
+        def fetch(tag: str):
+            try:
+                return client.get_tagged(tag, limit=14, sort=self.sort).posts
+            except Exception:  # noqa: BLE001 - one bad tag must not kill the feed
+                return []
+
+        posts = []
+        with ThreadPoolExecutor(max_workers=min(4, len(chunk)) or 1) as pool:
+            for batch in pool.map(fetch, chunk):
+                posts.extend(batch)
+
+        seen: set[str] = set()
+        unique = []
+        for post in posts:
+            if post.id and post.id not in seen:
+                seen.add(post.id)
+                unique.append(post)
+        if self.sort == "top":
+            unique.sort(key=lambda p: p.note_count, reverse=True)
+        else:
+            unique.sort(key=lambda p: p.timestamp, reverse=True)
+
+        import json as _json
+
+        next_offset = offset + self.batch
+        next_url = _json.dumps({"offset": next_offset}) if next_offset < len(tags) else None
+        return Page(posts=unique, next_url=next_url, total=None)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "sort": self.sort}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FollowedTagsSource":
+        return cls(sort=str(data.get("sort") or "latest"))
