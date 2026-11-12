@@ -93,3 +93,38 @@ security flows.
    edit/delete.
 4. **P4 (largely done)**: notes list + moderation, settings viewers, post mute client. Remaining:
    settings *writes* (routes unverified), blog-level block/mute, post edit/delete, notification actions.
+
+## Complete endpoint inventory (from the site's own chunks)
+
+Every path below was extracted from Tumblr's frontend JS (method + payload
+shape). Wired ones have a `TumblrClient` method; "inferred" means the payload
+field names could not be confirmed without performing the write.
+
+| Area | Endpoint | Method | Client | Status |
+|---|---|---|---|---|
+| Post delete | `/v2/blog/{blog}/post/delete` | POST | `delete_post` | ✅ wired |
+| Post quick state | `/v2/blog/{blog}/post/edit` | POST | `set_post_state` | ✅ wired |
+| Post full edit | `/v2/blog/{blog}/posts/{id}` | PUT | `edit_post` | ✅ wired |
+| Pin / unpin | `/v2/blog/{blog}/posts/{id}/pin` | POST/DELETE | `pin_post`/`unpin_post` | ✅ wired |
+| Block blog | `/v2/blog/{blog}/blocks` | POST/DELETE | `block_blog`/`unblock_blog` | ✅ wired |
+| Report | `/v2/report` | POST | `report` | ⚠️ fields partially inferred |
+| Poll vote | `/v2/polls/{pollId}` | POST | `vote_poll` | ✅ wired |
+| Follow tag | `/v2/user/tags/add` `/remove` | POST | `follow_tag`/`unfollow_tag` | ✅ wired |
+| Blog sub | `/v2/blog/{blog}/subscription` | POST/DELETE | `subscribe_blog`/`unsubscribe_blog` | ✅ wired |
+| Post sub | `/v2/blog/{blog}/posts/{id}/subscription` | POST/DELETE | `subscribe_post`/`unsubscribe_post` | ✅ wired |
+| Queue pause | `/v2/blog/{blog}/posts/queue/state` | POST | `set_queue_paused` | ✅ wired |
+| Queue shuffle | `…/posts/queue/shuffle` | POST | `shuffle_queue` | ✅ wired |
+| Queue reorder | `…/posts/queue/reorder` | POST | `reorder_queue` | ✅ wired |
+| Inbox delete | `/v2/user/inbox`, `/v2/blog/{blog}/posts/submission` | DELETE | `delete_inbox_submissions`/`delete_submission` | ✅ wired |
+| Activity read | `/v2/blog/{blog}/activity_last_read` | POST | `mark_activity_read` | ✅ wired |
+| Conversation delete | `/v2/conversations/messages` | DELETE | `delete_conversation` | ✅ wired |
+| Conversation flag | `/v2/conversations/flag` | POST | `flag_conversation` | ✅ wired |
+| Settings write | `/v2/blog/{blog}/settings`, `/v2/user/settings` | POST | `update_blog_settings`/`update_user_settings` | ✅ wired |
+| Mention suggest | `/v2/mention/{prefix}` | GET | `mention_suggestions` | ✅ wired |
+| Note delete | `/v2/blog/{blog}/notes/delete` | POST | `delete_note` | ✅ wired (timestamp-keyed) |
+| Note flag | `/v2/blog/{blog}/notes/flag` | POST | `flag_note` | ✅ wired |
+| Not interested | `/v2/explore/recommended` | DELETE | — | not wired |
+| Session mgmt | `/v2/user/session(s)`, `/v2/oauth2/revoke` | DELETE/POST | — | account pages excluded |
+| 2FA | `/v2/user/tfa/*` | POST | — | excluded (browser security flow) |
+| Premium/Blaze/domains | `/v2/premium/*`, `/v2/blaze/*`, `/v2/ignite/*`, `/v2/domains/*` | various | — | excluded (payments) |
+| Communities | `/v2/communities/*` | various | — | excluded (not in scope) |

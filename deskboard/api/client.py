@@ -594,6 +594,141 @@ class TumblrClient:
             method="DELETE",
         )
 
+
+    # -- post management --------------------------------------------------- #
+    def delete_post(self, post: "Post") -> None:
+        self.request(f"/v2/blog/{urllib.parse.quote(post.blog_name)}/post/delete",
+                     method="POST", body={"id": post.id})
+
+    def set_post_state(self, post: "Post", state: str = "published") -> None:
+        """Quick publish/unpublish/draft: ``POST /post/edit`` with just the state."""
+        self.request(f"/v2/blog/{urllib.parse.quote(post.blog_name)}/post/edit",
+                     method="POST", body={"id": post.id, "state": state})
+
+    def edit_post(self, post: "Post", content: list[dict], state: str = "published",
+                  tags: str | list[str] | None = None) -> None:
+        body: dict[str, Any] = {"content": json.dumps(content, separators=(",", ":")), "state": state}
+        if tags:
+            body["tags"] = ",".join(tags) if isinstance(tags, (list, tuple)) else str(tags)
+        self.request(f"/v2/blog/{urllib.parse.quote(post.blog_name)}/posts/{urllib.parse.quote(post.id)}",
+                     method="PUT", body=body)
+
+    def pin_post(self, post: "Post") -> None:
+        self.request(f"/v2/blog/{urllib.parse.quote(post.blog_name)}/posts/{post.id}/pin", method="POST")
+
+    def unpin_post(self, post: "Post") -> None:
+        self.request(f"/v2/blog/{urllib.parse.quote(post.blog_name)}/posts/{post.id}/pin", method="DELETE")
+
+    # -- blog blocking ----------------------------------------------------- #
+    def block_blog(self, acting_blog: str, target_blog: str, post_id: str = "",
+                   force: bool = False) -> None:
+        body: dict[str, Any] = {"blocked_tumblelog": target_blog, "force": force}
+        if post_id:
+            body["post_id"] = post_id
+        self.request(f"/v2/blog/{urllib.parse.quote(acting_blog)}/blocks", method="POST", body=body)
+
+    def unblock_blog(self, acting_blog: str, target_blog: str) -> None:
+        self.request(f"/v2/blog/{urllib.parse.quote(acting_blog)}/blocks", method="DELETE",
+                     body={"blocked_tumblelog": target_blog})
+
+    # -- reporting (fields per the site's report form; partially inferred) --- #
+    def report(self, **fields: Any) -> dict:
+        """Submit a report. Field names follow the web report form."""
+        data = self.request("/v2/report", method="POST",
+                            body={k: v for k, v in fields.items() if v is not None})
+        return data.get("response", {}) if isinstance(data, dict) else {}
+
+    # -- polls ------------------------------------------------------------- #
+    def vote_poll(self, poll_id: str, selection: str | list[str]) -> None:
+        self.request(f"/v2/polls/{urllib.parse.quote(poll_id)}", method="POST",
+                     body={"selected": selection})
+
+    # -- tags you follow --------------------------------------------------- #
+    def follow_tag(self, tag: str, source: str = "") -> None:
+        body: dict[str, Any] = {"tag": tag}
+        params = {"source": source} if source else None
+        self.request("/v2/user/tags/add", params, method="POST", body=body)
+
+    def unfollow_tag(self, tag: str) -> None:
+        self.request("/v2/user/tags/remove", method="POST", body={"tag": tag})
+
+    # -- blog / post subscriptions ----------------------------------------- #
+    def subscribe_blog(self, blog: str) -> None:
+        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/subscription", method="POST")
+
+    def unsubscribe_blog(self, blog: str) -> None:
+        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/subscription", method="DELETE")
+
+    def subscribe_post(self, post: "Post") -> None:
+        self.request(
+            f"/v2/blog/{urllib.parse.quote(post.blog_name)}/posts/{post.id}/subscription",
+            method="POST",
+        )
+
+    def unsubscribe_post(self, post: "Post") -> None:
+        self.request(
+            f"/v2/blog/{urllib.parse.quote(post.blog_name)}/posts/{post.id}/subscription",
+            method="DELETE",
+        )
+
+    # -- queue controls ---------------------------------------------------- #
+    def set_queue_paused(self, blog: str, paused: bool) -> None:
+        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/posts/queue/state",
+                     method="POST", body={"paused": paused})
+
+    def shuffle_queue(self, blog: str) -> None:
+        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/posts/queue/shuffle", method="POST")
+
+    def reorder_queue(self, blog: str, post_id: str, insert_after: str = "") -> None:
+        body: dict[str, Any] = {"post_id": post_id}
+        if insert_after:
+            body["insert_after"] = insert_after
+        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/posts/queue/reorder",
+                     method="POST", body=body)
+
+    # -- inbox ------------------------------------------------------------- #
+    def delete_submission(self, blog: str) -> None:
+        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/posts/submission", method="DELETE")
+
+    def delete_inbox_submissions(self) -> None:
+        self.request("/v2/user/inbox", method="DELETE")
+
+    # -- activity ---------------------------------------------------------- #
+    def mark_activity_read(self, blog: str) -> None:
+        self.request(f"/v2/blog/{urllib.parse.quote(blog)}/activity_last_read", method="POST")
+
+    # -- conversations (delete / flag) ------------------------------------- #
+    def delete_conversation(self, conversation_id: str, participant: str) -> None:
+        self.request("/v2/conversations/messages",
+                     {"conversation_id": conversation_id, "participant": participant},
+                     method="DELETE")
+
+    def flag_conversation(self, conversation_id: str, participant: str,
+                          type_: str = "spam", context: str = "inline") -> None:
+        self.request("/v2/conversations/flag", method="POST",
+                     body={"type": type_, "context": context,
+                           "conversation_id": conversation_id, "participant": participant})
+
+    # -- settings (writes) ------------------------------------------------- #
+    def update_blog_settings(self, blog: str, **values: Any) -> dict:
+        data = self.request(f"/v2/blog/{urllib.parse.quote(blog)}/settings",
+                            method="POST", body={k: v for k, v in values.items() if v is not None})
+        return data.get("response", {}) if isinstance(data, dict) else {}
+
+    def update_user_settings(self, **values: Any) -> dict:
+        data = self.request("/v2/user/settings", method="POST",
+                            body={k: v for k, v in values.items() if v is not None})
+        return data.get("response", {}) if isinstance(data, dict) else {}
+
+    # -- mention autocomplete (composer) ----------------------------------- #
+    def mention_suggestions(self, prefix: str = "") -> list[dict]:
+        clean = re.sub(r"[^a-zA-Z0-9-]", "", prefix or "")
+        path = "/v2/mention" + (f"/{urllib.parse.quote(clean)}" if clean else "")
+        data = self.request(path, {})
+        response = data.get("response", {}) if isinstance(data, dict) else {}
+        blogs = response.get("blogs") if isinstance(response, dict) else None
+        return [b for b in (blogs or []) if isinstance(b, dict)]
+
     # -- media upload (composer) ------------------------------------------- #
     def upload_image(self, path: str) -> dict:
         """Upload a local image and return the Tumblr **media object**.

@@ -47,7 +47,6 @@ from .notes import (
     note_display_name,
     note_formatting,
     note_key,
-    note_reply_id,
     note_reply_text,
     note_timestamp,
     note_type,
@@ -339,7 +338,9 @@ class NotesList(Gtk.Box):
         self._moderating: set[str] = set()
         self._moderation_epoch = 0
         self._report_dialog: Any = None
+        self._delete_dialog: Any = None
         self._demo = bool(getattr(ctx, "demo", False))
+        self._active = True
 
         self.store = Gio.ListStore(item_type=NoteItem)
         self.selection = Gtk.SingleSelection(
@@ -465,6 +466,7 @@ class NotesList(Gtk.Box):
         self._generation += 1
         self._moderation_epoch += 1
         self._moderating.clear()
+        self._active = False
         self._loading = False
 
     # -- building ----------------------------------------------------------- #
@@ -654,34 +656,34 @@ class NotesList(Gtk.Box):
     def _actions_for(self, note: dict[str, Any]) -> list[tuple[str, str, Any]]:
         """Build the per-note menu; empty when no action is *certain*.
 
-        "Delete reply" needs an explicit reply id from the payload (the live
-        notes route does not currently expose one, so this is hidden rather than
-        guessing).  "Report note" is only offered on notes on your own posts.
+        "Delete reply" targets Tumblr's timestamp-keyed notes-delete route, so it
+        only needs the reply author plus that note's raw timestamp (live notes
+        expose no reply id).  "Report note" is only offered on notes on your own
+        posts.
         """
-        if self._demo or self._destroyed or not self._signed_in():
+        if self._demo or self._destroyed or not self._active or not self._signed_in():
             return []
         actions: list[tuple[str, str, Any]] = []
         client = getattr(self.ctx, "client", None)
         author = note_blog_name(note).lower()
         own = self._own_blogs()
         is_own = bool(author) and author in own
+        created = note_created_time(note)
 
-        reply_id = note_reply_id(note)
         if (
             note_type(note) == "reply"
             and is_own
-            and reply_id
+            and created
             and self.blog
             and self.post_id
-            and callable(getattr(client, "delete_reply", None))
+            and callable(getattr(client, "delete_note", None))
         ):
             actions.append((
                 "Delete reply",
                 "user-trash-symbolic",
-                lambda note=note: self._delete_reply(note),
+                lambda note=note: self._confirm_delete(note),
             ))
 
-        created = note_created_time(note)
         if (
             self._post_is_own()
             and author
@@ -707,28 +709,95 @@ class NotesList(Gtk.Box):
             pass
         return -1
 
-    def _delete_reply(self, note: dict[str, Any]) -> None:
-        """Delete one of your replies, optimistically removing the row."""
-        if self._destroyed or not isinstance(note, dict):
+    def _find_note_by_author_time(self, blog_name: str, created: str) -> int:
+        wanted = str(blog_name or "").strip().lower()
+        if not wanted or not created:
+            return -1
+        try:
+            for index in range(self.store.get_n_items()):
+                item = self.store.get_item(index)
+                note = getattr(item, "note", None) if item is not None else None
+                if not isinstance(note, dict):
+                    continue
+                if (note_blog_name(note).lower() == wanted
+                        and note_created_time(note) == created):
+                    return index
+        except Exception:  # noqa: BLE001
+            pass
+        return -1
+
+    def _confirm_delete(self, note: dict[str, Any]) -> None:
+        if self._destroyed or not self._active or not isinstance(note, dict):
             return
-        reply_id = note_reply_id(note)
-        if not reply_id:
-            return  # never guess an id: the row stays put
-        if note_blog_name(note).lower() not in self._own_blogs():
+        blog_name = note_blog_name(note)
+        created = note_created_time(note)
+        if (note_type(note) != "reply" or not blog_name or not created
+                or blog_name.lower() not in self._own_blogs()):
+            return
+        if self._delete_dialog is not None:
+            return
+        try:
+            dialog = Adw.AlertDialog()
+            dialog.set_heading("Delete this reply?")
+            dialog.set_body(
+                f"Delete @{blog_name}'s reply from this post? This can't be undone."
+            )
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("delete", "Delete")
+            dialog.set_response_appearance(
+                "delete", Adw.ResponseAppearance.DESTRUCTIVE
+            )
+            dialog.set_default_response("cancel")
+            dialog.set_close_response("cancel")
+
+            def on_response(_dialog: Any, response: str) -> None:
+                self._delete_dialog = None
+                if response == "delete":
+                    self._delete_note(blog_name, created)
+
+            dialog.connect("response", on_response)
+            self._delete_dialog = dialog
+            parent = self.get_root()
+            if not isinstance(parent, Gtk.Window):
+                parent = getattr(self.ctx, "window", None)
+            dialog.present(parent if isinstance(parent, Gtk.Window) else None)
+        except Exception as exc:  # noqa: BLE001
+            self._delete_dialog = None
+            try:
+                self.ctx.toast(f"Couldn't open the delete dialog: {exc}")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _delete_note(self, blog_name: str, created: str) -> None:
+        """Delete one of your replies through the timestamp-keyed notes route.
+
+        ``blog_name`` is the reply author (one of your blogs) and ``created`` is
+        that note's raw ``timestamp``; no reply id exists in the live payload.
+        """
+        if self._destroyed or not self._active:
+            return
+        if not blog_name or not created or not self.blog or not self.post_id:
+            return
+        if blog_name.lower() not in self._own_blogs():
+            return
+        index = self._find_note_by_author_time(blog_name, created)
+        if index < 0:
+            return
+        try:
+            item = self.store.get_item(index)
+            note = dict(getattr(item, "note", None) or {})
+        except Exception:  # noqa: BLE001
             return
         key = note_key(note)
         if key in self._moderating:
             return
-        index = self._find_note_index(key)
-        if index < 0:
-            return
-        note_copy = dict(note)
         try:
             self.store.remove(index)
         except Exception:  # noqa: BLE001
             return
         self._moderating.add(key)
         epoch = self._moderation_epoch
+        generation = self._generation
         if self._total is not None:
             try:
                 self._total = max(0, int(self._total) - 1)
@@ -739,21 +808,19 @@ class NotesList(Gtk.Box):
 
         blog, post_id = self.blog, self.post_id
         client = self.ctx.client
-        generation = self._generation
 
-        # ``blog`` is the post's blog, matching the notes resource we browsed.
-        # This write path is intentionally unexercised: current live note
-        # payloads carry no reply id, so the action above stays hidden.
         def work() -> None:
             error = ""
             try:
-                client.delete_reply(blog, post_id, reply_id)
+                # blog = the post's blog (the notes page we are on);
+                # note_tumblelog = reply author; created = raw note timestamp.
+                client.delete_note(blog, blog_name, created, post_id)
             except Exception as exc:  # noqa: BLE001 - reverted in the UI
                 error = describe_error(exc)
             try:
                 GLib.idle_add(
-                    self._finish_delete_reply,
-                    epoch, generation, key, index, note_copy, error,
+                    self._finish_delete_note,
+                    epoch, generation, key, index, note, error,
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -761,12 +828,12 @@ class NotesList(Gtk.Box):
         try:
             threading.Thread(target=work, daemon=True, name="note-delete").start()
         except Exception as exc:  # noqa: BLE001 - e.g. resource exhaustion
-            self._finish_delete_reply(
-                epoch, generation, key, index, note_copy, describe_error(exc)
+            self._finish_delete_note(
+                epoch, generation, key, index, note, describe_error(exc)
             )
 
-    def _finish_delete_reply(self, epoch: int, generation: int, key: str,
-                             index: int, note: dict[str, Any], error: str) -> bool:
+    def _finish_delete_note(self, epoch: int, generation: int, key: str,
+                            index: int, note: dict[str, Any], error: str) -> bool:
         try:
             if self._destroyed or epoch != self._moderation_epoch:
                 return False
@@ -799,7 +866,7 @@ class NotesList(Gtk.Box):
             return False
 
     def _confirm_report(self, note: dict[str, Any]) -> None:
-        if self._destroyed or not self._post_is_own():
+        if self._destroyed or not self._active or not self._post_is_own():
             return
         flagged = note_blog_name(note)
         created = note_created_time(note)
@@ -841,7 +908,8 @@ class NotesList(Gtk.Box):
                 pass
 
     def _report_note(self, note: dict[str, Any]) -> None:
-        if self._destroyed or not self._post_is_own() or not self._signed_in():
+        if (self._destroyed or not self._active or not self._post_is_own()
+                or not self._signed_in()):
             return
         flagged = note_blog_name(note)
         created = note_created_time(note)
@@ -1089,6 +1157,7 @@ class PostDetailPage(Gtk.Box):
 
         # Reply composer state (built with the post view below).
         self._destroyed = False
+        self._active = True
         self._replying = False
         self._reply_token = 0
         self._reply_active = False
@@ -1174,6 +1243,7 @@ class PostDetailPage(Gtk.Box):
             pass
 
     def cleanup(self) -> None:
+        self._active = False
         self._reply_token += 1
         self._replying = False
         self._mute_token += 1
@@ -1372,7 +1442,7 @@ class PostDetailPage(Gtk.Box):
         return blog
 
     def _send_reply(self) -> None:
-        if self._replying or not self._reply_active:
+        if self._replying or not self._reply_active or not self._active:
             return
         entry = self._reply_entry
         if entry is None:
@@ -1600,7 +1670,7 @@ class PostDetailPage(Gtk.Box):
         return button
 
     def _toggle_mute(self) -> None:
-        if self._mute_busy or not self._mute_active:
+        if self._mute_busy or not self._mute_active or not self._active:
             return
         client = self.ctx.client
         post = self.post
