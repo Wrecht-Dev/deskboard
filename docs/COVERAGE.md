@@ -14,7 +14,7 @@ deliberately **not** exercised (they mutate the account).
 | Dashboard "Following" | `GET /v2/timeline/dashboard?wrapped-timeline=true` | ✅ |
 | Dashboard "Home / For you" | `GET /v2/tabs/for_you` | ✅ |
 | Blog feed | `GET /v2/blog/{blog}/posts` | ✅ |
-| Tag page | `GET /v2/tagged?tag=` | ✅ (parser fixed — response is a bare list) |
+| Tag page | `GET /v2/hubs/{tag}/timeline?sort=top&limit=14` (the site's own request, captured live) | ✅ Latest/Top UI; note: server currently returns the same set for both, so `top` also orders by note count locally |
 | Post search | `GET /v2/timeline/search?query=` | ✅ |
 | Blog + tag + community search | `GET /v2/search/blogs?query=`, `/v2/search/tags` | 🟡 |
 | Explore / recommended | `GET /v2/explore/recommended` | 🟡 |

@@ -444,15 +444,30 @@ class TumblrClient:
         return self._to_page(self.request("/v2/timeline/search", {"query": query, "limit": limit}))
 
     def get_tagged(self, tag: str, limit: int = config.PAGE_SIZE, sort: str = "latest") -> Page:
-        """Tag pages (``/v2/tagged``).
+        """Posts for a tag.
 
-        ``sort`` is ``"latest"`` or ``"top"``; the web expresses it in the page
-        URL (``/tagged/{tag}?sort=top``).
+        The website's tag page requests ``/v2/hubs/{tag}/timeline`` with
+        ``sort=top`` when the "Top" tab is active (captured live), so we send
+        exactly that. Tumblr currently returns the same set for both sorts on
+        some accounts; for ``top`` we therefore also order the page by note
+        count so the tab behaves as users expect until the server differentiates.
         """
-        params = {"tag": tag, "limit": limit}
-        if sort and sort != "latest":
-            params["sort"] = sort
-        return self._to_page(self.request("/v2/tagged", params))
+        params: dict[str, Any] = {"limit": max(limit, 14)}
+        if sort == "top":
+            params["sort"] = "top"
+        try:
+            page = self._to_page(self.request(f"/v2/hubs/{urllib.parse.quote(tag)}/timeline", params))
+        except TumblrError:
+            page = None
+        if page is None or not page.posts:
+            # legacy endpoint as a fallback
+            legacy = {"tag": tag, "limit": limit}
+            if sort == "top":
+                legacy["sort"] = "top"
+            page = self._to_page(self.request("/v2/tagged", legacy))
+        if sort == "top" and page.posts:
+            page.posts = sorted(page.posts, key=lambda p: p.note_count, reverse=True)
+        return page
 
     def _to_items(self, data: dict, keys: tuple[str, ...], before_key: str = "before") -> ItemPage:
         if isinstance(data, list):
