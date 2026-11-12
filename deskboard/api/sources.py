@@ -71,7 +71,11 @@ class FeedSource:
         if self.kind == BLOG:
             return client.get_blog_posts(self.value)
         if self.kind == TAGGED:
-            return client.get_tagged(self.value, sort=self.sort)
+            try:
+                return client.get_tagged(self.value, sort=self.sort)
+            except TypeError:
+                # Older clients and the offline demo predate the sort argument.
+                return client.get_tagged(self.value)
         if self.kind == SEARCH:
             return client.search(self.value)
         if self.kind == FOLLOWING:
@@ -91,4 +95,5 @@ class FeedSource:
     def from_dict(cls, data: dict[str, Any]) -> "FeedSource":
         kind = str(data.get("kind") or DASHBOARD)
         value = str(data.get("value") or "")
-        return cls(kind=kind, value=value)
+        sort = str(data.get("sort") or "latest")
+        return cls(kind=kind, value=value, sort=sort)

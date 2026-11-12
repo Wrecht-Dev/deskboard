@@ -241,3 +241,207 @@
   color: @warning_color;
   font-size: 0.95em;
 }
+
+/* ---------------------------------------------------------- Tumblr-inspired
+ * A focused polish pass: Tumblr's deep navy (#36465d) as the brand accent,
+ * calmer cards without hard borders, a denser navigation sidebar and pill
+ * tags.  Only named colors / alpha are used so light and dark stay legible.
+ */
+@define-color deskboard_blue #36465d;
+@define-color deskboard_blue_soft #4f6684;
+@define-color accent_color #529ecc;
+@define-color accent_bg_color #36465d;
+
+.deskboard-sidebar {
+  background-color: alpha(@deskboard_blue, 0.055);
+  border-right: 1px solid alpha(@deskboard_blue, 0.12);
+}
+
+.sidebar-heading-box {
+  margin: 13px 10px 3px 10px;
+}
+
+.sidebar-heading {
+  font-size: 0.72em;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+}
+
+.sidebar-heading-count {
+  font-size: 0.70em;
+  opacity: 0.45;
+}
+
+.sidebar-row {
+  min-height: 29px;
+  border-radius: 8px;
+  margin: 0 4px;
+}
+
+.sidebar-row label {
+  font-weight: 600;
+}
+
+.sidebar-row:hover {
+  background-color: alpha(@deskboard_blue, 0.08);
+}
+
+.deskboard-sidebar .sidebar-row:selected,
+.deskboard-sidebar .sidebar-row:selected:hover {
+  background-color: alpha(@deskboard_blue, 0.16);
+  color: @window_fg_color;
+  border-left: 3px solid @accent_color;
+}
+
+.sidebar-glyph {
+  color: @accent_color;
+  opacity: 0.8;
+}
+
+.tags-scroller {
+  margin: 2px 4px 5px 4px;
+}
+
+.tags-scroller .tags-list {
+  background: transparent;
+}
+
+.tags-list row {
+  border-radius: 8px;
+}
+
+.tags-list row:hover {
+  background-color: alpha(@deskboard_blue, 0.08);
+}
+
+.tag-options {
+  opacity: 0.18;
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+}
+
+.tags-list row:hover .tag-options,
+.tag-options:hover,
+.tag-options:focus {
+  opacity: 0.9;
+}
+
+/* Post cards: lighter borders, softer corners and more breathing room. */
+.post-row {
+  border-left: none;
+  border-radius: 12px;
+  padding: 0;
+}
+
+.post-card {
+  background-color: @card_bg_color;
+  border: 1px solid alpha(@window_fg_color, 0.055);
+  border-radius: 12px;
+  padding: 16px 18px 12px 18px;
+  margin: 7px 10px;
+}
+
+.compact .post-card {
+  border-radius: 10px;
+  padding: 10px 12px 8px 12px;
+  margin: 3px 6px;
+}
+
+.post-card .post-author {
+  border-radius: 8px;
+  padding: 2px 4px;
+  margin-left: -4px;
+}
+
+.post-card .post-author:hover {
+  background-color: alpha(@deskboard_blue, 0.07);
+}
+
+.post-card .post-trail {
+  background-color: alpha(@deskboard_blue, 0.045);
+  border-left: 2px solid alpha(@accent_color, 0.45);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 4px 0 8px 0;
+}
+
+.post-card .trail-content {
+  opacity: 0.94;
+}
+
+.post-card .post-body {
+  margin-top: 2px;
+}
+
+.post-card .post-tag {
+  background-color: alpha(@deskboard_blue, 0.09);
+  border-radius: 999px;
+  padding: 1px 2px;
+  margin: 2px 2px;
+}
+
+.post-card .post-tag button {
+  padding: 1px 9px;
+  border-radius: 999px;
+  color: @accent_color;
+  font-size: 0.92em;
+  font-weight: 600;
+}
+
+.post-card .post-tag button:hover {
+  background-color: alpha(@deskboard_blue, 0.16);
+}
+
+.post-card .post-tag-follow {
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  opacity: 0.65;
+}
+
+.post-card .db-media-frame,
+.post-card .db-video-frame,
+.post-card picture {
+  border-radius: 12px;
+}
+
+/* Tag chips on Explore and the tag-sort toggle. */
+.tag-chip {
+  padding: 4px 13px;
+  font-weight: 650;
+  border-radius: 999px;
+  background-color: alpha(@deskboard_blue, 0.09);
+}
+
+.tag-chip:hover {
+  background-color: alpha(@deskboard_blue, 0.16);
+}
+
+.tag-sort-toggle {
+  margin-left: 6px;
+  background-color: alpha(@window_fg_color, 0.06);
+  border-radius: 999px;
+  padding: 1px;
+}
+
+.tag-sort-toggle button {
+  padding: 3px 12px;
+  font-weight: 600;
+  border-radius: 999px;
+  background-color: transparent;
+}
+
+.tag-sort-toggle button:checked {
+  background-color: @deskboard_blue_soft;
+  color: white;
+}
+
+.blog-header-card,
+.notification-unread {
+  border-color: alpha(@window_fg_color, 0.055);
+}
+
+.notification-unread {
+  background-color: alpha(@deskboard_blue, 0.08);
+}

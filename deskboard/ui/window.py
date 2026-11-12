@@ -48,6 +48,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._about_dialog = None
         self._signout_dialog = None
         self._composer = None
+        self._tag_sort_syncing = False
         self._unsubscribes: list = []
         self._like_inflight: set[str] = set()
 
@@ -122,6 +123,23 @@ class MainWindow(Adw.ApplicationWindow):
         self.refresh_button.set_tooltip_text("Refresh (Ctrl+R)")
         self.refresh_button.connect("clicked", lambda *_args: self.refresh_current())
         header.pack_start(self.refresh_button)
+
+        self.tag_sort_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.tag_sort_box.add_css_class("linked")
+        self.tag_sort_box.add_css_class("tag-sort-toggle")
+        self.tag_sort_box.set_valign(Gtk.Align.CENTER)
+        self.tag_sort_latest = Gtk.ToggleButton(label="Latest")
+        self.tag_sort_latest.add_css_class("flat")
+        self.tag_sort_top = Gtk.ToggleButton(label="Top")
+        self.tag_sort_top.add_css_class("flat")
+        self.tag_sort_top.set_group(self.tag_sort_latest)
+        self.tag_sort_latest.connect("toggled", self._on_tag_sort_toggled)
+        self.tag_sort_top.connect("toggled", self._on_tag_sort_toggled)
+        self.tag_sort_box.append(self.tag_sort_latest)
+        self.tag_sort_box.append(self.tag_sort_top)
+        self.tag_sort_box.set_visible(False)
+        self.tag_sort_box.set_tooltip_text("Sort this tag's posts")
+        header.pack_start(self.tag_sort_box)
 
         self.compose_button = Gtk.Button.new_from_icon_name("document-new-symbolic")
         self.compose_button.set_tooltip_text("New post (Ctrl+N)")
@@ -417,7 +435,15 @@ class MainWindow(Adw.ApplicationWindow):
             title = f"Search: {value}"
         elif kind == "dashboard":
             title = "Following"
-        return FeedSource(kind=kind, value=value, title=title)
+        sort = "latest"
+        if kind == "tagged":
+            if value.endswith(":top"):
+                value = value[:-4]
+                sort = "top"
+            elif value.endswith(":latest"):
+                value = value[:-7]
+            title = f"#{value}"
+        return FeedSource(kind=kind, value=value, title=title, sort=sort)
 
     def _needs_onboarding(self, source) -> bool:
         if self.ctx.demo or self.ctx.is_signed_in:
@@ -498,6 +524,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.set_title(f"{label} — {config.APP_NAME}")
         except Exception:  # noqa: BLE001
             pass
+        self._update_tag_sort_switcher(None)
         self._update_back_button()
         try:
             if self.split.get_collapsed():
@@ -718,6 +745,72 @@ class MainWindow(Adw.ApplicationWindow):
         if url:
             self.ctx.open_url(url)
 
+    def _update_tag_sort_switcher(self, source) -> None:
+        try:
+            tagged = source is not None and getattr(source, "kind", "") == "tagged"
+            self.tag_sort_box.set_visible(bool(tagged))
+            if not tagged:
+                return
+            top = str(getattr(source, "sort", "latest")) == "top"
+            self._tag_sort_syncing = True
+            try:
+                self.tag_sort_top.set_active(top)
+                self.tag_sort_latest.set_active(not top)
+            finally:
+                self._tag_sort_syncing = False
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_tag_sort_toggled(self, button) -> None:
+        if self._tag_sort_syncing:
+            return
+        source = self.current_source
+        if source is None or getattr(source, "kind", "") != "tagged":
+            return
+        sort = "top" if self.tag_sort_top.get_active() else "latest"
+        if sort == str(getattr(source, "sort", "latest")):
+            return
+        self._switch_tag_sort(sort)
+
+    def _switch_tag_sort(self, sort: str) -> None:
+        source = self.current_source
+        if source is None or getattr(source, "kind", "") != "tagged":
+            return
+        fraction = 0.0
+        old_page = self.feed_page
+        try:
+            if old_page is not None:
+                adjustment = old_page.scroller.get_vadjustment()
+                span = max(1.0, adjustment.get_upper() - adjustment.get_page_size())
+                fraction = adjustment.get_value() / span
+        except Exception:  # noqa: BLE001
+            fraction = 0.0
+        new_source = FeedSource(
+            "tagged",
+            value=str(source.value or ""),
+            title=str(source.title or f"#{source.value}"),
+            sort=sort,
+        )
+        self.open_feed(new_source)
+        if fraction > 0.02:
+            def restore() -> bool:
+                try:
+                    page = self.feed_page
+                    if page is None or self.current_source is not new_source:
+                        return False
+                    adjustment = page.scroller.get_vadjustment()
+                    span = max(0.0, adjustment.get_upper() - adjustment.get_page_size())
+                    if span > 0:
+                        adjustment.set_value(min(span, max(0.0, fraction * span)))
+                except Exception:  # noqa: BLE001
+                    pass
+                return False
+
+            try:
+                GLib.timeout_add(450, restore)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _feed_subtitle(self, source, count: int | None = None, total: int | None = None) -> str:
         """A short, informative second line for the header."""
         kind = getattr(source, "kind", "")
@@ -733,6 +826,8 @@ class MainWindow(Adw.ApplicationWindow):
             base = f"@{source.value}.tumblr.com"
         elif kind == "tagged":
             base = f"#{source.value}"
+            if str(getattr(source, "sort", "latest")) == "top":
+                base += " · Top"
         elif kind == "search":
             base = f"\u201c{source.value}\u201d"
         else:
@@ -762,12 +857,14 @@ class MainWindow(Adw.ApplicationWindow):
                 self.window_title.set_subtitle("Tumblr")
                 self.content_page.set_title("Deskboard")
                 self.set_title(config.APP_NAME)
+                self._update_tag_sort_switcher(None)
                 return
             label = source.label
             self.window_title.set_title(label)
             self.window_title.set_subtitle(self._feed_subtitle(source))
             self.content_page.set_title(label)
             self.set_title(f"{label} — {config.APP_NAME}")
+            self._update_tag_sort_switcher(source)
         except Exception:  # noqa: BLE001
             pass
 

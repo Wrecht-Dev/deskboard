@@ -995,13 +995,6 @@ class PostCard(Gtk.Box):
         return bool(blog) and blog in self._own_blogs()
 
     def _acting_blog(self) -> str:
-        try:
-            prefs = getattr(self.ctx, "prefs", None)
-            posting = str(prefs.get("posting_blog", "") or "").strip() if prefs else ""
-            if posting:
-                return posting
-        except Exception:  # noqa: BLE001
-            pass
         primary = str(getattr(self.ctx, "user_blog", "") or "").strip()
         if primary:
             return primary
@@ -1009,6 +1002,13 @@ class PostCard(Gtk.Box):
             name = str(value or "").strip()
             if name:
                 return name
+        try:
+            prefs = getattr(self.ctx, "prefs", None)
+            posting = str(prefs.get("posting_blog", "") or "").strip() if prefs else ""
+            if posting:
+                return posting
+        except Exception:  # noqa: BLE001
+            pass
         return ""
 
     def _action_key(self, kind: str) -> tuple[str, str, str]:
@@ -1275,6 +1275,17 @@ class PostCard(Gtk.Box):
                 pass
 
 
+        post = self.post
+        url = (getattr(post, "post_url", "") or "").strip()
+        if url:
+            return url
+        blog = (getattr(post, "blog_name", "") or "").strip()
+        post_id = str(getattr(post, "id", "") or "").strip()
+        if blog and post_id:
+            return f"https://{blog}.tumblr.com/post/{post_id}"
+        return ""
+
+    def _post_url(self) -> str:
         post = self.post
         url = (getattr(post, "post_url", "") or "").strip()
         if url:

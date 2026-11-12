@@ -459,9 +459,13 @@ class Sidebar(Gtk.Box):
                 label.set_ellipsize(3)
                 label.set_hexpand(True)
                 box.append(label)
+                box.append(self._build_tag_options(tag))
                 row.set_child(box)
                 inner.append(row)
                 self._tag_rows[source.key] = row
+                self._tag_rows[
+                    FeedSource("tagged", value=tag, title=f"#{tag}", sort="top").key
+                ] = row
 
             scroller = Gtk.ScrolledWindow()
             scroller.add_css_class("tags-scroller")
@@ -488,6 +492,58 @@ class Sidebar(Gtk.Box):
         except Exception:  # noqa: BLE001
             self._tags_listbox = None
             self._tags_scroller = None
+
+    def _build_tag_options(self, tag: str) -> Gtk.MenuButton:
+        button = Gtk.MenuButton()
+        button.set_icon_name("view-more-symbolic")
+        button.add_css_class("flat")
+        button.add_css_class("tag-options")
+        button.set_valign(Gtk.Align.CENTER)
+        button.set_tooltip_text("Tag options")
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        latest = Gtk.Button(label="Open Latest")
+        latest.add_css_class("flat")
+        latest.set_halign(Gtk.Align.FILL)
+        top = Gtk.Button(label="Open Top")
+        top.add_css_class("flat")
+        top.set_halign(Gtk.Align.FILL)
+
+        def choose(sort: str) -> None:
+            try:
+                popover.popdown()
+            except Exception:  # noqa: BLE001
+                pass
+            self._open_tag_sort(tag, sort)
+
+        latest.connect("clicked", lambda *_args: choose("latest"))
+        top.connect("clicked", lambda *_args: choose("top"))
+        box.append(latest)
+        box.append(top)
+        popover.set_child(box)
+        button.set_popover(popover)
+        return button
+
+    def _open_tag_sort(self, tag: str, sort: str) -> None:
+        source = FeedSource("tagged", value=tag, title=f"#{tag}", sort=sort)
+        self._selected_key = source.key
+        try:
+            self._syncing = True
+            self.listbox.unselect_all()
+            if self._tags_listbox is not None:
+                self._tags_listbox.unselect_all()
+            self._syncing = False
+        except Exception:  # noqa: BLE001
+            self._syncing = False
+        if callable(self.on_select):
+            try:
+                self.on_select(source)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _on_tag_row_selected(self, _listbox, row) -> None:
         if self._syncing or row is None:
@@ -602,7 +658,7 @@ class Sidebar(Gtk.Box):
                     if tag and key not in seen:
                         seen.add(key)
                         cleaned.append(tag)
-                self._tags = cleaned[:200]
+                self._tags = cleaned
                 self._rebuild()
             else:
                 self._tags_pending = True

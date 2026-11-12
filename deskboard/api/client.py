@@ -376,30 +376,64 @@ class TumblrClient:
         blogs = response.get("blogs") if isinstance(response, dict) else None
         return [Blog.from_api(item) for item in (blogs or []) if isinstance(item, dict)]
 
-    def get_followed_tags(self, limit: int = 50) -> list[str]:
-        """Tags this account follows.
+    def get_followed_tags(self, limit: int = 200) -> list[str]:
+        """Every tag this account follows, paging through ``/v2/user/tags``.
 
-        Tumblr's ``/v2/user/tags`` returns ``{count, tags: [{id, name, …}]}``.
-        (``/v2/user/tags/following`` exists in the web bundle but answers 400,
-        so it is only kept as a fallback for future API reshuffles.)
+        Tumblr's response is ``{count, tags: [{id, name, …}]}``; ``count`` is
+        the total, so a 200-row response is not the whole set. ``limit`` is the
+        page size (clamped to 200); the loop continues until all tags are read
+        or the server stops returning new names.
         """
-        try:
-            data = self.request("/v2/user/tags", {"limit": limit})
-        except TumblrError as exc:
-            if exc.status != 400:
-                raise
-            data = self.request("/v2/user/tags/following")
-        response = data.get("response", {})
-        tags = response.get("tags") if isinstance(response, dict) else None
+        page_size = max(1, min(int(limit or 200), 200))
         out: list[str] = []
-        for item in tags or []:
-            name = ""
-            if isinstance(item, str):
-                name = item
-            elif isinstance(item, dict):
-                name = str(item.get("name") or "")
-            if name and name not in out:
+        seen: set[str] = set()
+        offset = 0
+        total: int | None = None
+        used_fallback = False
+        for _page in range(100):
+            try:
+                data = self.request(
+                    "/v2/user/tags", {"limit": page_size, "offset": offset}
+                )
+            except TumblrError as exc:
+                if exc.status != 400 or offset or used_fallback:
+                    raise
+                used_fallback = True
+                data = self.request("/v2/user/tags/following")
+            response = data.get("response", {}) if isinstance(data, dict) else {}
+            tags = response.get("tags") if isinstance(response, dict) else None
+            if isinstance(response, dict):
+                try:
+                    count = response.get("count")
+                    total = int(count) if count is not None else None
+                except (TypeError, ValueError):
+                    total = None
+            raw_count = 0
+            added = 0
+            for item in tags or []:
+                raw_count += 1
+                name = ""
+                if isinstance(item, str):
+                    name = item.strip()
+                elif isinstance(item, dict):
+                    name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
                 out.append(name)
+                added += 1
+            if used_fallback or not tags:
+                break
+            if total is not None and len(out) >= total:
+                break
+            if total is None and raw_count < page_size:
+                break
+            if not added or raw_count == 0:
+                break
+            offset += raw_count
         return out
 
     def get_user_info(self) -> dict:

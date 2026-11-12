@@ -288,8 +288,8 @@ def _person_initials(person: Any) -> str:
     return (letters[0] + letters[-1]).upper()
 
 
-def _conversation_people(conversation: Any, ctx: Any = None) -> list[Any]:
-    """Participants other than the signed-in account, in payload order."""
+def _participants_raw(conversation: Any) -> list[Any]:
+    """Every participant (including the account owner), in payload order."""
     if not isinstance(conversation, dict):
         return []
     raw = conversation.get("participants")
@@ -312,6 +312,12 @@ def _conversation_people(conversation: Any, ctx: Any = None) -> list[Any]:
                 people.append({"name": str(key)})
     elif isinstance(raw, str) and raw.strip():
         people.append({"name": raw.strip()})
+    return people
+
+
+def _conversation_people(conversation: Any, ctx: Any = None) -> list[Any]:
+    """Participants other than the signed-in account, in payload order."""
+    people = _participants_raw(conversation)
     me: set[str] = set()
     if ctx is not None:
         for attribute in ("user_name", "user_blog"):
@@ -334,6 +340,137 @@ def _conversation_people(conversation: Any, ctx: Any = None) -> list[Any]:
         if others and len(others) < len(people):
             return others
     return people
+
+
+def _participant_tokens(person: Any) -> set[str]:
+    """Every identifier a message may use for this participant.
+
+    Tumblr's DM route identifies senders by the participant's ``key``
+    (``t:<uuid-ish>``); older payloads used the blog name.  Accept both.
+    """
+    tokens: set[str] = set()
+    if isinstance(person, str):
+        text = person.strip().casefold()
+        if text:
+            tokens.add(text)
+        return tokens
+    if not isinstance(person, dict):
+        return tokens
+    for field in ("key", "uuid", "id", "name", "blogName", "blog_name", "title"):
+        value = person.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        text = value.strip()
+        tokens.add(text.casefold())
+        if field == "uuid":
+            tokens.add(f"t:{text}".casefold())
+        elif field == "key" and ":" not in text:
+            tokens.add(f"t:{text}".casefold())
+    return tokens
+
+
+def _primary_person(conversation: Any) -> Any:
+    for person in _participants_raw(conversation):
+        if isinstance(person, dict) and as_bool(person.get("primary")):
+            return person
+    return None
+
+
+def _person_is_me(person: Any, ctx: Any = None) -> bool:
+    if not isinstance(person, dict):
+        return False
+    if as_bool(person.get("primary")):
+        return True
+    if ctx is None:
+        return False
+    identity: set[str] = set()
+    for attribute in ("user_name", "user_blog"):
+        value = _collapse(getattr(ctx, attribute, "") or "").casefold()
+        if value:
+            identity.add(value)
+    return bool(identity and (_person_aliases(person) & identity))
+
+
+def _resolve_message_person(conversation: Any, message: Any) -> Any:
+    """Map ``message.participant`` (usually ``t:<key>``) to a participant."""
+    sender = _message_sender(message).casefold()
+    if not sender:
+        return None
+    for person in _participants_raw(conversation):
+        if sender in _participant_tokens(person):
+            return person
+    return None
+
+
+def _message_display_sender(conversation: Any, message: Any, ctx: Any = None) -> str:
+    person = _resolve_message_person(conversation, message)
+    if person is not None:
+        return _person_display(person) or _message_sender(message)
+    return _message_sender(message)
+
+
+def _message_millis(message: Any) -> int:
+    """Raw ordering timestamp in milliseconds (``ts`` may be a digit string)."""
+    if not isinstance(message, dict):
+        return 0
+    for key in ("ts", "timestamp", "createdAt", "created_at", "sentAt", "sent_at", "time"):
+        if key not in message:
+            continue
+        value = message.get(key)
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        number = _as_float(value)
+        if number and number > 0:
+            return int(number) if number > 100_000_000_000 else int(number * 1000)
+    return 0
+
+
+def _message_pagination_ts(message: Any) -> str:
+    """The value to send as ``before=`` for the page older than ``message``."""
+    if not isinstance(message, dict):
+        return ""
+    for key in ("ts", "timestamp", "createdAt", "created_at", "sentAt", "sent_at", "time"):
+        if key not in message:
+            continue
+        value = message.get(key)
+        if isinstance(value, str) and value.strip().isdigit():
+            return value.strip()
+        number = _as_float(value)
+        if number and number > 0:
+            # Normalise seconds to the millisecond form Tumblr's cursor uses.
+            return str(int(number)) if number > 100_000_000_000 else str(int(number * 1000))
+    return ""
+
+
+def _message_oldest_ms(messages: list) -> int:
+    stamps = [_message_millis(message) for message in messages or []]
+    known = [stamp for stamp in stamps if stamp > 0]
+    return min(known) if known else 0
+
+
+def _message_oldest_cursor(messages: list) -> str:
+    """The ``before=`` value for the page older than ``messages``."""
+    best = None
+    best_ms = None
+    for message in messages or []:
+        millis = _message_millis(message)
+        if millis <= 0:
+            continue
+        if best_ms is None or millis < best_ms:
+            best, best_ms = message, millis
+    return _message_pagination_ts(best) if best is not None else ""
+
+
+def _message_list(value: Any) -> list[dict]:
+    """Accept a list or the ``{"data": [...]}`` container the DM route uses."""
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        for key in ("data", "messages", "items", "results"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return [item for item in nested if isinstance(item, dict)]
+    return []
 
 
 def _conversation_title(conversation: Any, ctx: Any = None) -> str:
@@ -394,13 +531,10 @@ def _conversation_spam(conversation: Any) -> bool:
 def _conversation_last_message(conversation: Any) -> dict | None:
     if not isinstance(conversation, dict):
         return None
-    raw = conversation.get("messages")
-    if not isinstance(raw, list):
-        return None
-    messages = [item for item in raw if isinstance(item, dict)]
+    messages = _message_list(conversation.get("messages"))
     if not messages:
         return None
-    stamps = [_message_timestamp(message) for message in messages]
+    stamps = [_message_millis(message) for message in messages]
     if any(stamps):
         best_index = max(range(len(stamps)), key=lambda index: stamps[index])
         return messages[best_index]
@@ -537,11 +671,19 @@ def _message_is_mine(ctx: Any, conversation: Any, message: Any) -> bool:
     me = _collapse(getattr(ctx, "user_name", "") if ctx is not None else "").casefold()
     if me and sender == me:
         return True
+    resolved = _resolve_message_person(conversation, message)
+    if resolved is not None:
+        return _person_is_me(resolved, ctx)
     for person in _conversation_people(conversation, ctx):
         if sender in _person_aliases(person):
             return False
-    # A sender that is not one of the (other) participants is the account
-    # owner; conversations only list the people on the other side.
+    # Ambiguous token: the primary participant is the account owner, so its
+    # messages belong on the right (lead-verified payload shape).
+    primary = _primary_person(conversation)
+    if primary is not None:
+        return _person_is_me(primary, ctx)
+    # Legacy payload without a primary marker: a sender that is not one of the
+    # other participants is the account owner.
     return True
 
 
@@ -551,7 +693,7 @@ def _message_key(message: Any, fallback: int = 0) -> str:
     identifier = message.get("id")
     if identifier not in (None, ""):
         return f"id:{identifier}"
-    stamp = _message_timestamp(message)
+    stamp = _message_pagination_ts(message) or str(_message_timestamp(message))
     sender = _message_sender(message)
     text = _message_text(message)
     return f"raw:{stamp}|{sender}|{text[:64]}"
@@ -588,11 +730,7 @@ def _conversation_snippet(conversation: Any, ctx: Any = None) -> str:
     if len(people) > 1:
         if _message_is_mine(ctx, conversation, message):
             return f"You: {base}"
-        sender = _collapse(_message_sender(message), 28)
-        for person in people:
-            if sender and sender.casefold() in _person_aliases(person):
-                sender = _person_display(person) or sender
-                break
+        sender = _collapse(_message_display_sender(conversation, message, ctx), 28)
         if sender:
             return f"{sender}: {base}"
     return base
@@ -1551,6 +1689,7 @@ class ConversationPage(Gtk.Box):
         self._fill_source_id = 0
         self._fill_attempts = 0
         self._vadj_handler = 0
+        self._oldest_ms = 0
 
         self._conversation_id = _conversation_id(self.conversation)
         self._people = _conversation_people(self.conversation, ctx)
@@ -1641,6 +1780,7 @@ class ConversationPage(Gtk.Box):
         self._seen_cursors.clear()
         self._keys.clear()
         self._error = ""
+        self._oldest_ms = 0
         self._fill_attempts = 0
         self._cancel_fill()
         try:
@@ -2394,17 +2534,7 @@ class ConversationPage(Gtk.Box):
             bubble.add_css_class("db-msg-pending")
 
         if not mine and self._group:
-            raw_sender = _message_sender(message).casefold()
-            sender = _person_display(
-                next(
-                    (
-                        person
-                        for person in self._people
-                        if raw_sender and raw_sender in _person_aliases(person)
-                    ),
-                    None,
-                )
-            ) or _message_sender(message)
+            sender = _message_display_sender(self.conversation, message, self.ctx)
             if sender:
                 name = _label(
                     _collapse(sender, 40), css=("caption", "db-msg-sender"), wrap=True
@@ -2631,7 +2761,9 @@ class ConversationPage(Gtk.Box):
                 return False
 
             self._error = ""
+            before_oldest = self._oldest_ms
             ordered = _chronological(items)
+            page_oldest = _message_oldest_ms(ordered)
             # When everything already fit in the viewport, the user is looking
             # at the bottom (newest) and backfilling must keep it there; a
             # real "scroll up for older" keeps the current message pinned.
@@ -2645,10 +2777,31 @@ class ConversationPage(Gtk.Box):
             next_cursor = before_from_url(next_url) if next_url else None
             if next_cursor and next_cursor not in self._seen_cursors:
                 self._cursor = next_cursor
+                self._oldest_ms = page_oldest or before_oldest
                 self._finished = False
+            elif initial:
+                # The DM route carries no links.next: paginate by the oldest
+                # real message timestamp (`before=<oldest ts>`).
+                self._oldest_ms = page_oldest
+                cursor = _message_oldest_cursor(ordered)
+                self._cursor = cursor or None
+                self._finished = self._cursor is None
             else:
-                self._cursor = None
-                self._finished = True
+                progressed = bool(
+                    page_oldest and (not before_oldest or page_oldest < before_oldest)
+                )
+                if not ordered or not progressed:
+                    self._cursor = None
+                    self._finished = True
+                else:
+                    self._oldest_ms = page_oldest
+                    cursor = _message_oldest_cursor(ordered)
+                    if cursor and cursor not in self._seen_cursors:
+                        self._cursor = cursor
+                        self._finished = False
+                    else:
+                        self._cursor = None
+                        self._finished = True
 
             if self.store.get_n_items() == 0:
                 self._show_state("empty")
@@ -2894,11 +3047,13 @@ def _chronological(messages: list) -> list:
     """Order one API page oldest → newest without trusting its direction."""
     if not messages:
         return []
-    stamps = [_message_timestamp(message) for message in messages]
+    # Milliseconds, not seconds: the DM route can put several messages in the
+    # same second and the payload itself is not ordered.
+    stamps = [_message_millis(message) for message in messages]
     known = [stamp for stamp in stamps if stamp > 0]
     if known:
         if len(known) == len(stamps):
-            return sorted(messages, key=lambda message: _message_timestamp(message))
+            return sorted(messages, key=lambda message: _message_millis(message))
         # Mixed timestamps: use whichever end of the page looks older as the
         # anchor, but keep the payload order stable.
         if stamps[0] <= stamps[-1]:
