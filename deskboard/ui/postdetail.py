@@ -43,11 +43,14 @@ from .notes import (
     load_notes_page,
     note_avatar_url,
     note_blog_name,
+    note_created_time,
     note_display_name,
     note_formatting,
     note_key,
+    note_reply_id,
     note_reply_text,
     note_timestamp,
+    note_type,
     note_verb,
 )
 from .postcard import PostCard
@@ -142,7 +145,8 @@ class NoteItem(GObject.Object):
 class _NoteRow(Gtk.Box):
     """One note: avatar, clickable actor, verb, relative time, reply body."""
 
-    def __init__(self, note: dict[str, Any], ctx: Any) -> None:
+    def __init__(self, note: dict[str, Any], ctx: Any,
+                 actions: list[tuple[str, str, Any]] | None = None) -> None:
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         self.add_css_class("db-detail-note")
         self.set_margin_start(18)
@@ -203,6 +207,9 @@ class _NoteRow(Gtk.Box):
             time_label.set_valign(Gtk.Align.CENTER)
             line.append(time_label)
 
+        if actions:
+            line.append(self._build_actions_menu(actions))
+
         body.append(line)
 
         reply = note_reply_text(note)
@@ -254,6 +261,47 @@ class _NoteRow(Gtk.Box):
             pass
 
     # -- actions ------------------------------------------------------------ #
+    def _build_actions_menu(self, actions: list[tuple[str, str, Any]]) -> Gtk.Widget:
+        menu = Gtk.MenuButton()
+        menu.add_css_class("flat")
+        menu.add_css_class("db-detail-note-menu")
+        menu.set_icon_name("view-more-symbolic")
+        menu.set_tooltip_text("Note actions")
+        menu.set_valign(Gtk.Align.CENTER)
+
+        popover = Gtk.Popover()
+        box = _box(spacing=2)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+        for label, icon, callback in actions:
+            button = Gtk.Button()
+            button.add_css_class("flat")
+            button.set_halign(Gtk.Align.FILL)
+            content = Adw.ButtonContent(icon_name=icon, label=label)
+            content.set_halign(Gtk.Align.START)
+            button.set_child(content)
+
+            def activate(_button: Gtk.Button, cb: Any = callback) -> None:
+                try:
+                    popover.popdown()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    cb()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            button.connect("clicked", activate)
+            box.append(button)
+        popover.set_child(box)
+        try:
+            menu.set_popover(popover)
+        except Exception:  # noqa: BLE001 - older GTK naming
+            pass
+        return menu
+
     def _open_blog(self, name: str) -> None:
         try:
             self._ctx.publish("open-blog", name)
@@ -288,6 +336,10 @@ class NotesList(Gtk.Box):
         self._footer_error = ""
         self._seen: set[str] = set()
         self._destroyed = False
+        self._moderating: set[str] = set()
+        self._moderation_epoch = 0
+        self._report_dialog: Any = None
+        self._demo = bool(getattr(ctx, "demo", False))
 
         self.store = Gio.ListStore(item_type=NoteItem)
         self.selection = Gtk.SingleSelection(
@@ -323,6 +375,17 @@ class NotesList(Gtk.Box):
         self.stack.add_named(self._build_error_page(), "error")
         self.stack.add_named(content, "content")
         self.stack.set_visible_child_name("loading")
+        if self._demo:
+            demo_hint = Gtk.Label(label="Demo mode — note moderation is disabled.")
+            demo_hint.set_wrap(True)
+            demo_hint.set_xalign(0.0)
+            demo_hint.add_css_class("caption")
+            demo_hint.add_css_class("dim-label")
+            demo_hint.add_css_class("db-detail-notes-demo")
+            demo_hint.set_margin_start(18)
+            demo_hint.set_margin_end(18)
+            demo_hint.set_margin_top(8)
+            self.append(demo_hint)
         self.append(self.stack)
 
         self.connect("destroy", self._on_destroy)
@@ -400,6 +463,8 @@ class NotesList(Gtk.Box):
     def cleanup(self) -> None:
         """Invalidate any in-flight worker; called when the page is replaced."""
         self._generation += 1
+        self._moderation_epoch += 1
+        self._moderating.clear()
         self._loading = False
 
     # -- building ----------------------------------------------------------- #
@@ -534,7 +599,7 @@ class NotesList(Gtk.Box):
             note = getattr(data, "note", None) if data is not None else None
             if holder is None or not isinstance(note, dict):
                 return
-            holder.append(_NoteRow(note, self.ctx))
+            holder.append(_NoteRow(note, self.ctx, self._actions_for(note)))
         except Exception:  # noqa: BLE001 - one broken note must not break the list
             try:
                 if holder is not None:
@@ -555,6 +620,280 @@ class NotesList(Gtk.Box):
         try:
             _clear_box(self._holder_for_item(item))
             item.set_child(None)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # -- moderation --------------------------------------------------------- #
+    def _own_blogs(self) -> set[str]:
+        names: list[str] = []
+        try:
+            for value in getattr(self.ctx, "user_blogs", None) or []:
+                name = str(value or "").strip()
+                if name:
+                    names.append(name.lower())
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            primary = str(getattr(self.ctx, "user_blog", "") or "").strip()
+            if primary:
+                names.append(primary.lower())
+        except Exception:  # noqa: BLE001
+            pass
+        return set(names)
+
+    def _signed_in(self) -> bool:
+        try:
+            return bool(getattr(self.ctx, "is_signed_in", False))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _post_is_own(self) -> bool:
+        blog = str(self.blog or "").strip().lower()
+        return bool(blog) and blog in self._own_blogs()
+
+    def _actions_for(self, note: dict[str, Any]) -> list[tuple[str, str, Any]]:
+        """Build the per-note menu; empty when no action is *certain*.
+
+        "Delete reply" needs an explicit reply id from the payload (the live
+        notes route does not currently expose one, so this is hidden rather than
+        guessing).  "Report note" is only offered on notes on your own posts.
+        """
+        if self._demo or self._destroyed or not self._signed_in():
+            return []
+        actions: list[tuple[str, str, Any]] = []
+        client = getattr(self.ctx, "client", None)
+        author = note_blog_name(note).lower()
+        own = self._own_blogs()
+        is_own = bool(author) and author in own
+
+        reply_id = note_reply_id(note)
+        if (
+            note_type(note) == "reply"
+            and is_own
+            and reply_id
+            and self.blog
+            and self.post_id
+            and callable(getattr(client, "delete_reply", None))
+        ):
+            actions.append((
+                "Delete reply",
+                "user-trash-symbolic",
+                lambda note=note: self._delete_reply(note),
+            ))
+
+        created = note_created_time(note)
+        if (
+            self._post_is_own()
+            and author
+            and not is_own
+            and created
+            and callable(getattr(client, "flag_note", None))
+        ):
+            actions.append((
+                "Report note",
+                "dialog-warning-symbolic",
+                lambda note=note: self._confirm_report(note),
+            ))
+        return actions
+
+    def _find_note_index(self, key: str) -> int:
+        try:
+            for index in range(self.store.get_n_items()):
+                item = self.store.get_item(index)
+                note = getattr(item, "note", None) if item is not None else None
+                if isinstance(note, dict) and note_key(note) == key:
+                    return index
+        except Exception:  # noqa: BLE001
+            pass
+        return -1
+
+    def _delete_reply(self, note: dict[str, Any]) -> None:
+        """Delete one of your replies, optimistically removing the row."""
+        if self._destroyed or not isinstance(note, dict):
+            return
+        reply_id = note_reply_id(note)
+        if not reply_id:
+            return  # never guess an id: the row stays put
+        if note_blog_name(note).lower() not in self._own_blogs():
+            return
+        key = note_key(note)
+        if key in self._moderating:
+            return
+        index = self._find_note_index(key)
+        if index < 0:
+            return
+        note_copy = dict(note)
+        try:
+            self.store.remove(index)
+        except Exception:  # noqa: BLE001
+            return
+        self._moderating.add(key)
+        epoch = self._moderation_epoch
+        if self._total is not None:
+            try:
+                self._total = max(0, int(self._total) - 1)
+            except (TypeError, ValueError):
+                pass
+        self._update_header()
+        self._sync_after_removal()
+
+        blog, post_id = self.blog, self.post_id
+        client = self.ctx.client
+        generation = self._generation
+
+        # ``blog`` is the post's blog, matching the notes resource we browsed.
+        # This write path is intentionally unexercised: current live note
+        # payloads carry no reply id, so the action above stays hidden.
+        def work() -> None:
+            error = ""
+            try:
+                client.delete_reply(blog, post_id, reply_id)
+            except Exception as exc:  # noqa: BLE001 - reverted in the UI
+                error = describe_error(exc)
+            try:
+                GLib.idle_add(
+                    self._finish_delete_reply,
+                    epoch, generation, key, index, note_copy, error,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="note-delete").start()
+        except Exception as exc:  # noqa: BLE001 - e.g. resource exhaustion
+            self._finish_delete_reply(
+                epoch, generation, key, index, note_copy, describe_error(exc)
+            )
+
+    def _finish_delete_reply(self, epoch: int, generation: int, key: str,
+                             index: int, note: dict[str, Any], error: str) -> bool:
+        try:
+            if self._destroyed or epoch != self._moderation_epoch:
+                return False
+            self._moderating.discard(key)
+            if error:
+                # Put the row back only if the list has not been reloaded since;
+                # a reload reflects the server's state and is authoritative.
+                if generation == self._generation and self._find_note_index(key) < 0:
+                    try:
+                        position = max(0, min(index, self.store.get_n_items()))
+                        self.store.insert(position, NoteItem(dict(note)))
+                        if self._total is not None:
+                            self._total = int(self._total) + 1
+                        self._show_state("content")
+                        self._update_header()
+                        self._sync_footer()
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    self.ctx.toast(f"Couldn't delete reply: {error}")
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                try:
+                    self.ctx.toast("Reply deleted")
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
+        except Exception:  # noqa: BLE001 - never break the page
+            return False
+
+    def _confirm_report(self, note: dict[str, Any]) -> None:
+        if self._destroyed or not self._post_is_own():
+            return
+        flagged = note_blog_name(note)
+        created = note_created_time(note)
+        if not flagged or not created:
+            return
+        if self._report_dialog is not None:
+            return
+        try:
+            dialog = Adw.AlertDialog()
+            dialog.set_heading("Report this note?")
+            dialog.set_body(
+                f"Report @{flagged}'s note on this post to Tumblr? "
+                "The note stays visible."
+            )
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("report", "Report")
+            dialog.set_response_appearance(
+                "report", Adw.ResponseAppearance.DESTRUCTIVE
+            )
+            dialog.set_default_response("cancel")
+            dialog.set_close_response("cancel")
+
+            def on_response(_dialog: Any, response: str) -> None:
+                self._report_dialog = None
+                if response == "report":
+                    self._report_note(note)
+
+            dialog.connect("response", on_response)
+            self._report_dialog = dialog
+            parent = self.get_root()
+            if not isinstance(parent, Gtk.Window):
+                parent = getattr(self.ctx, "window", None)
+            dialog.present(parent if isinstance(parent, Gtk.Window) else None)
+        except Exception as exc:  # noqa: BLE001
+            self._report_dialog = None
+            try:
+                self.ctx.toast(f"Couldn't open the report dialog: {exc}")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _report_note(self, note: dict[str, Any]) -> None:
+        if self._destroyed or not self._post_is_own() or not self._signed_in():
+            return
+        flagged = note_blog_name(note)
+        created = note_created_time(note)
+        if not flagged or not created:
+            return
+        key = note_key(note)
+        if key in self._moderating:
+            return
+        self._moderating.add(key)
+        epoch = self._moderation_epoch
+        blog = self.blog
+        client = self.ctx.client
+
+        def work() -> None:
+            error = ""
+            try:
+                client.flag_note(blog, flagged, created)
+            except Exception as exc:  # noqa: BLE001 - surfaced as a toast
+                error = describe_error(exc)
+            try:
+                GLib.idle_add(self._finish_report, epoch, key, error)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="note-report").start()
+        except Exception as exc:  # noqa: BLE001 - e.g. resource exhaustion
+            self._finish_report(epoch, key, describe_error(exc))
+
+    def _finish_report(self, epoch: int, key: str, error: str) -> bool:
+        try:
+            if self._destroyed or epoch != self._moderation_epoch:
+                return False
+            self._moderating.discard(key)
+            try:
+                if error:
+                    self.ctx.toast(f"Couldn't report note: {error}")
+                else:
+                    self.ctx.toast("Note reported")
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _sync_after_removal(self) -> None:
+        try:
+            if self.store.get_n_items() == 0 and not self._next_url:
+                self._show_state("empty")
+            else:
+                self._show_state("content")
+            self._sync_footer()
         except Exception:  # noqa: BLE001
             pass
 
@@ -760,6 +1099,16 @@ class PostDetailPage(Gtk.Box):
         self._reply_error: Gtk.Label | None = None
         self._reply_hint: Gtk.Label | None = None
 
+        # Post-mute state (mute is a bookkeeping action, not a post field).
+        self._post_muted = False
+        self._mute_busy = False
+        self._mute_token = 0
+        self._mute_button: Gtk.Button | None = None
+        self._mute_spinner: Adw.Spinner | None = None
+        self._mute_label: Gtk.Label | None = None
+        self._mute_icon: Gtk.Image | None = None
+        self._mute_active = False
+
         self._stack = Adw.ViewStack()
         self._stack.set_vexpand(True)
         post_page = self._stack.add_titled(self._build_post_page(), "post", "Post")
@@ -827,6 +1176,8 @@ class PostDetailPage(Gtk.Box):
     def cleanup(self) -> None:
         self._reply_token += 1
         self._replying = False
+        self._mute_token += 1
+        self._mute_busy = False
         try:
             self.notes.cleanup()
         except Exception:  # noqa: BLE001
@@ -1192,10 +1543,146 @@ class PostDetailPage(Gtk.Box):
         copy_button.connect("clicked", lambda *_args: self._copy_url(url))
         row.append(copy_button)
 
+        mute_button = self._build_mute_button()
+        if mute_button is not None:
+            row.append(mute_button)
+
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         row.append(spacer)
         return row
+
+    # -- post mute ---------------------------------------------------------- #
+    def _build_mute_button(self) -> Gtk.Widget | None:
+        demo = bool(getattr(self.ctx, "demo", False))
+        try:
+            signed_in = bool(self.ctx.is_signed_in)
+        except Exception:  # noqa: BLE001
+            signed_in = False
+        client = getattr(self.ctx, "client", None)
+        can_mute = callable(getattr(client, "mute_post", None)) and callable(
+            getattr(client, "unmute_post", None)
+        )
+        if not demo and (not signed_in or not can_mute):
+            return None
+
+        self._mute_active = bool(signed_in and can_mute and not demo)
+        button = Gtk.Button()
+        button.add_css_class("db-detail-action")
+        button.add_css_class("db-detail-mute")
+        button.set_sensitive(self._mute_active)
+        button.connect("clicked", lambda *_args: self._toggle_mute())
+
+        content = _box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        spinner = Adw.Spinner()
+        spinner.set_size_request(14, 14)
+        spinner.set_visible(False)
+        icon = Gtk.Image.new_from_icon_name("view-conceal-symbolic")
+        label = Gtk.Label(label="Mute post")
+        content.append(spinner)
+        content.append(icon)
+        content.append(label)
+        button.set_child(content)
+        self._mute_button = button
+        self._mute_spinner = spinner
+        self._mute_icon = icon
+        self._mute_label = label
+        self._sync_mute_button()
+
+        if demo:
+            wrapper = _box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            wrapper.append(button)
+            hint = Gtk.Label(label="Demo mode — muting is disabled.")
+            _dim(hint)
+            hint.add_css_class("db-detail-mute-hint")
+            wrapper.append(hint)
+            return wrapper
+        return button
+
+    def _toggle_mute(self) -> None:
+        if self._mute_busy or not self._mute_active:
+            return
+        client = self.ctx.client
+        post = self.post
+        muting = not self._post_muted
+        self._mute_token += 1
+        token = self._mute_token
+        self._set_mute_busy(True)
+
+        def work() -> None:
+            error = ""
+            try:
+                if muting:
+                    client.mute_post(post)
+                else:
+                    client.unmute_post(post)
+            except Exception as exc:  # noqa: BLE001 - surfaced as a toast
+                error = describe_error(exc)
+            try:
+                GLib.idle_add(self._finish_mute, token, muting, error)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            threading.Thread(target=work, daemon=True, name="post-mute").start()
+        except Exception as exc:  # noqa: BLE001 - e.g. resource exhaustion
+            self._finish_mute(token, muting, describe_error(exc))
+
+    def _finish_mute(self, token: int, muting: bool, error: str) -> bool:
+        try:
+            if token != self._mute_token or self._destroyed:
+                return False
+            if not error:
+                self._post_muted = muting
+            self._set_mute_busy(False)
+            try:
+                if error:
+                    verb = "mute" if muting else "unmute"
+                    self.ctx.toast(f"Couldn't {verb} post: {error}")
+                else:
+                    self.ctx.toast("Post muted" if muting else "Post unmuted")
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        except Exception:  # noqa: BLE001 - never break the page
+            return False
+
+    def _set_mute_busy(self, busy: bool) -> None:
+        self._mute_busy = bool(busy)
+        try:
+            if self._mute_spinner is not None:
+                self._mute_spinner.set_visible(bool(busy))
+            if self._mute_icon is not None:
+                self._mute_icon.set_visible(not busy)
+            if self._mute_label is not None and busy:
+                self._mute_label.set_text("Unmuting…" if self._post_muted else "Muting…")
+            if self._mute_button is not None:
+                self._mute_button.set_sensitive(self._mute_active and not busy)
+            if not busy:
+                self._sync_mute_button()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _sync_mute_button(self) -> None:
+        try:
+            if self._mute_label is not None:
+                self._mute_label.set_text("Unmute post" if self._post_muted else "Mute post")
+            if self._mute_icon is not None:
+                self._mute_icon.set_from_icon_name(
+                    "view-reveal-symbolic" if self._post_muted else "view-conceal-symbolic"
+                )
+            if self._mute_button is not None:
+                demo = bool(getattr(self.ctx, "demo", False))
+                if demo:
+                    tooltip = "Demo mode: muting is disabled"
+                elif self._post_muted:
+                    tooltip = "Show this post in your feeds again"
+                else:
+                    tooltip = "Hide this post from your feeds"
+                self._mute_button.set_tooltip_text(tooltip)
+                self._mute_button.set_sensitive(self._mute_active and not self._mute_busy)
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- actions ------------------------------------------------------------ #
     def _go_back(self) -> None:

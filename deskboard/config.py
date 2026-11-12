@@ -66,6 +66,7 @@ class Preferences:
         "compact": False,
         "nsfw_blur": True,
         "theme": "system",  # system | light | dark
+        "posting_blog": "",  # blog used by the composer / reply-as ("" = primary)
         "last_feed": "home",
     }
 

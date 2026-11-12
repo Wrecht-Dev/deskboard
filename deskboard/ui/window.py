@@ -1430,10 +1430,13 @@ class MainWindow(Adw.ApplicationWindow):
             window.set_transient_for(self)
             self._settings_window = window
 
-            def on_destroy(*_args) -> None:
+            def on_close_request(*_args) -> bool:
                 self._settings_window = None
+                return False
 
-            window.connect("destroy", on_destroy)
+            # GTK4 has no widget "destroy" signal; close-request is the
+            # lifecycle signal that actually fires when preferences close.
+            window.connect("close-request", on_close_request)
             window.present()
         except Exception as exc:  # noqa: BLE001
             self.toast(f"Couldn't open preferences: {exc}")

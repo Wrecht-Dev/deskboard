@@ -5,6 +5,7 @@ under ``response.notes``; this module keeps everything that does **not** need
 GTK in one place so the widget can stay about layout and lifecycle:
 
 * note-dict normalisation (actor, action wording, avatar, timestamp, reply),
+* moderation field accessors (explicit reply id, raw timestamp),
 * deduplication keys across page boundaries,
 * the two pagination styles the endpoint has used.
 
@@ -121,6 +122,53 @@ def note_followed(note: Any) -> bool:
     if not isinstance(note, dict):
         return False
     return bool(note.get("followed"))
+
+
+#: Candidate keys for an explicit reply id in a notes payload.
+#:
+#: NOTE: this mapping is a **guess**.  Verified live notes responses (likes,
+#: replies and reblogs on a public ``staff`` post, signed-in session) carry no
+#: reply id at all, so :func:`note_reply_id` returns "" for every live note and
+#: the UI hides "Delete reply".  Never fall back to a timestamp, blog name or
+#: any other field here: a wrong id would delete the wrong reply.
+_REPLY_ID_FIELDS = ("replyId", "reply_id")
+
+
+def note_reply_id(note: Any) -> str:
+    """An explicit reply id, if (and only if) the API supplied one."""
+    if not isinstance(note, dict):
+        return ""
+    for key in _REPLY_ID_FIELDS:
+        value = note.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            if value <= 0:
+                continue
+            text = str(value)
+        elif isinstance(value, str):
+            text = value.strip()
+        else:
+            continue
+        if text and text != "0":
+            return text
+    return ""
+
+
+def note_created_time(note: Any) -> str:
+    """The raw note timestamp for note-targeting writes, precision preserved.
+
+    Replies from the live endpoint carry fractional timestamps
+    (``1794256896.868151``), so callers must not round this through
+    :func:`note_timestamp`; ``delete_note``/``flag_note`` need exactly the value
+    the notes payload supplied.  Returns "" when there is no usable timestamp.
+    """
+    if not isinstance(note, dict):
+        return ""
+    value = note.get("timestamp")
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    return _text(value)
 
 
 def note_reply_text(note: Any) -> str:

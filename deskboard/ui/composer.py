@@ -81,6 +81,27 @@ class ComposerWindow(Adw.Window):
         self.add_controller(controller)
 
     # -- construction ------------------------------------------------------ #
+    def _default_blog(self) -> str:
+        """Primary unless the user explicitly picked a posting identity."""
+        blogs = list(self._blogs)
+        try:
+            stored = str(self.ctx.prefs.get("posting_blog", "") or "")
+        except Exception:  # noqa: BLE001
+            stored = ""
+        if stored and stored in blogs:
+            return stored
+        if stored and blogs:
+            # The saved blog was deleted/renamed; fall back and clear it so the
+            # stale identity does not linger (lead-approved repair on read).
+            try:
+                self.ctx.prefs.set("posting_blog", "")
+            except Exception:  # noqa: BLE001
+                pass
+        primary = str(getattr(self.ctx, "user_blog", "") or "")
+        if primary in blogs:
+            return primary
+        return blogs[0] if blogs else ""
+
     def _collect_blogs(self) -> list[str]:
         blogs: list[str] = []
         for name in getattr(self.ctx, "user_blogs", None) or []:
@@ -126,7 +147,7 @@ class ComposerWindow(Adw.Window):
         self.blog_dropdown.set_valign(Gtk.Align.CENTER)
         if self._blogs:
             try:
-                default = str(getattr(self.ctx, "user_blog", "") or "")
+                default = self._default_blog()
                 index = self._blogs.index(default) if default in self._blogs else 0
                 self.blog_dropdown.set_selected(index)
             except Exception:  # noqa: BLE001

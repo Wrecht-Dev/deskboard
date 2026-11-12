@@ -29,8 +29,8 @@ deliberately **not** exercised (they mutate the account).
 | **Inbox (asks/submissions)** | `GET /v2/user/inbox` | 🟡 |
 | **Drafts** | `GET /v2/blog/{blog}/posts/draft` | 🟡 |
 | **Queue** | `GET /v2/blog/{blog}/posts/queue` | 🟡 |
-| Blog settings | `GET /v2/blog/{blog}/settings` | 🟡 |
-| Account/user settings | `GET /v2/user/settings` | 🟡 |
+| Blog settings (view) | `GET /v2/blog/{blog}/settings` | ✅ read-only page; writes unverified |
+| Account/user settings (view) | `GET /v2/user/settings` | ✅ read-only page (27 booleans) |
 | GIF library | `GET /v2/gif/popular` | 🟡 |
 | Notifications filters | `GET /v2/activity/filters` | 🔵 |
 | Note list on a post | `GET /v2/blog/{blog}/notes?id=&mode=` | 🟡 |
@@ -45,7 +45,7 @@ deliberately **not** exercised (they mutate the account).
 | Follow / unfollow | `POST /v2/user/follow`, `/v2/user/unfollow` | ✅ blog header button; revert on error |
 | Reply to a post | `POST /v2/user/post/reply` | ✅ post-detail composer; optimistic prepend |
 | Send ask / submit | ✗ not found at guessed paths | ❗ needs RE |
-| Block / mute | ✗ not found at guessed paths | ❗ needs RE |
+| Mute a post (in-feed) | `POST/DELETE /v2/blog/{blog}/posts/{id}/mute` | 🟡 client ready; card-menu wiring pending |
 | DM send / accept / read | `POST /v2/conversations/messages`, `/accept`, `/mark_as_read` | ✅ composer, accept, auto mark-read |
 
 **Write auth: solved.** Reads accept `Authorization: Bearer <public web token>`
@@ -91,4 +91,5 @@ security flows.
    into the UI; only the single authorized like/unlike was ever fired.
 3. **P3**: composer (text/quote/link/photo), media upload, queue/draft/schedule,
    edit/delete.
-4. **P4**: notes list, block/mute, remaining settings.
+4. **P4 (largely done)**: notes list + moderation, settings viewers, post mute client. Remaining:
+   settings *writes* (routes unverified), blog-level block/mute, post edit/delete, notification actions.
