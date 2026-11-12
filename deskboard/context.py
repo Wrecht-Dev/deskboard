@@ -123,8 +123,19 @@ class AppContext:
 
         def work() -> None:
             ok = False
+            info: dict = {}
+            for attempt in range(2):
+                try:
+                    info = self.client.get_user_info()
+                    if info:
+                        break
+                except Exception:  # noqa: BLE001 - retried once, then reported
+                    info = {}
+                    if attempt == 0:
+                        import time as _time
+
+                        _time.sleep(0.4)
             try:
-                info = self.client.get_user_info()
                 name = str(info.get("name") or "")
                 blogs = [
                     str(item.get("name") or "")

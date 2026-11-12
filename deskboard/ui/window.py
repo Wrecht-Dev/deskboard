@@ -1167,15 +1167,45 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             client.reblog(post, blog, comment)
 
+    def _preferred_blog(self) -> str:
+        """The blog writes should go to: chosen posting blog, else primary."""
+        ctx = self.ctx
+        try:
+            pref = str(ctx.prefs.get("posting_blog") or "")
+        except Exception:  # noqa: BLE001
+            pref = ""
+        blogs = [str(b) for b in (getattr(ctx, "user_blogs", None) or []) if b]
+        if pref and (not blogs or pref in blogs):
+            return pref
+        if blogs:
+            return blogs[0]
+        return str(getattr(ctx, "user_blog", "") or "") or str(getattr(ctx, "user_name", "") or "")
+
+    def _retry_reblog(self, post) -> bool:
+        if not self._preferred_blog():
+            self.toast(
+                "Couldn't load your blogs. Re-import your session in Settings → Account."
+            )
+            return False
+        self.open_reblog_dialog(post)
+        return False
+
     def open_reblog_dialog(self, post) -> None:
         if not self._can_write():
             self.toast("Sign in to reblog posts.")
             return
-        blog = str(getattr(self.ctx, "user_blog", "") or "")
-        if not blog and getattr(self.ctx, "user_blogs", None):
-            blog = str(self.ctx.user_blogs[0])
+        blog = self._preferred_blog()
         if not blog:
-            self.toast("No blog is available to reblog to.")
+            # Identity usually arrives a moment after launch; wait for it
+            # instead of failing with an empty blog list.
+            if getattr(self.ctx, "is_signed_in", False):
+                self.toast("Loading your blogs…")
+                try:
+                    self.ctx.load_user(lambda _ok: self._retry_reblog(post))
+                except Exception:  # noqa: BLE001
+                    self.toast("No blog is available to reblog to.")
+            else:
+                self.toast("No blog is available to reblog to.")
             return
         if self._reblog_dialog is not None:
             try:
