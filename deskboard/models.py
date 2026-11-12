@@ -439,6 +439,11 @@ class Blog:
     uuid: str = ""
     is_following: bool = False
     can_follow: bool = False
+    ask: bool = False            # accepts asks
+    ask_anon: bool = False       # allows anonymous asks
+    ask_page_title: str = ""
+    can_submit: bool = False     # accepts submissions
+    can_message: bool = False
 
     @property
     def display_name(self) -> str:
@@ -476,6 +481,11 @@ class Blog:
             uuid=str(get(data, "uuid") or ""),
             is_following=_bool(get(data, "isFollowing", False)),
             can_follow=_bool(get(data, "canFollow", True), True),
+            ask=_bool(get(data, "ask", False)),
+            ask_anon=_bool(get(data, "askAnon", False)),
+            ask_page_title=str(get(data, "askPageTitle") or ""),
+            can_submit=_bool(get(data, "canSubmit", False)),
+            can_message=_bool(get(data, "canMessage", False)),
         )
 
 

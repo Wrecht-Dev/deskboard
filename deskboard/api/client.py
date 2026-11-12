@@ -704,6 +704,22 @@ class TumblrClient:
                             body={k: v for k, v in fields.items() if v is not None})
         return data.get("response", {}) if isinstance(data, dict) else {}
 
+    # -- asks -------------------------------------------------------------- #
+    def send_ask(self, blog: str, question: str, anonymous: bool = False) -> None:
+        """Send an anonymous/named ask to a blog that accepts them.
+
+        Route and required field confirmed live (empty body answers
+        "You must supply a question to ask."); ``anonymous`` follows the web
+        form. Nothing is sent unless the caller explicitly invokes this.
+        """
+        if not question.strip():
+            raise ValueError("an ask needs a question")
+        self.request(
+            f"/v2/blog/{urllib.parse.quote(blog)}/ask",
+            method="POST",
+            body={"question": question, "anonymous": bool(anonymous)},
+        )
+
     # -- polls ------------------------------------------------------------- #
     def vote_poll(self, poll_id: str, selection: str | list[str]) -> None:
         self.request(f"/v2/polls/{urllib.parse.quote(poll_id)}", method="POST",
