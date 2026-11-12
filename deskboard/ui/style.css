@@ -433,7 +433,8 @@
   background-color: transparent;
 }
 
-.tag-sort-toggle button:checked {
+.tag-sort-toggle button:checked,
+.tag-sort-toggle button.tag-sort-active {
   background-color: @deskboard_blue_soft;
   color: white;
 }

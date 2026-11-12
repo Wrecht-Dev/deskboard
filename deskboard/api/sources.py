@@ -84,7 +84,7 @@ class FeedSource:
         raise ValueError(f"unknown feed kind: {self.kind}")
 
     def requires_session(self) -> bool:
-        return self.kind in (HOME, DASHBOARD, LIKES, FOLLOWING, SEARCH)
+        return self.kind in (HOME, DASHBOARD, LIKES, FOLLOWING, SEARCH, MYTAGS)
 
     def as_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"kind": self.kind, "value": self.value}
@@ -150,6 +150,12 @@ class FollowedTagsSource(FeedSource):
         def fetch(tag: str):
             try:
                 return client.get_tagged(tag, limit=14, sort=self.sort).posts
+            except TypeError:
+                # DemoClient and older clients predate the sort argument.
+                try:
+                    return client.get_tagged(tag, limit=14).posts
+                except Exception:  # noqa: BLE001
+                    return []
             except Exception:  # noqa: BLE001 - one bad tag must not kill the feed
                 return []
 
@@ -174,6 +180,11 @@ class FollowedTagsSource(FeedSource):
         next_offset = offset + self.batch
         next_url = _json.dumps({"offset": next_offset}) if next_offset < len(tags) else None
         return Page(posts=unique, next_url=next_url, total=None)
+
+    @property
+    def key(self) -> str:
+        base = super().key
+        return f"{base}:top" if self.sort == "top" else base
 
     def as_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "sort": self.sort}

@@ -19,14 +19,14 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from .. import config
-from ..api.sources import FeedSource
+from ..api.sources import FeedSource, FollowedTagsSource
 from .feed import FeedPage
 from .onboarding import OnboardingPage
 from .settings import SettingsWindow
 from .sidebar import Sidebar
 
-_SESSION_FEEDS = ("home", "dashboard", "likes", "following")
-_KNOWN_FEEDS = ("home", "dashboard", "likes", "blog", "tagged", "search", "following")
+_SESSION_FEEDS = ("home", "dashboard", "likes", "following", "mytags")
+_KNOWN_FEEDS = ("home", "dashboard", "likes", "blog", "tagged", "search", "following", "mytags")
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -435,6 +435,8 @@ class MainWindow(Adw.ApplicationWindow):
             title = f"Search: {value}"
         elif kind == "dashboard":
             title = "Following"
+        if kind == "mytags":
+            return FollowedTagsSource(sort="top" if value == "top" else "latest")
         sort = "latest"
         if kind == "tagged":
             if value.endswith(":top"):
@@ -769,15 +771,24 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _update_tag_sort_switcher(self, source) -> None:
         try:
-            tagged = source is not None and getattr(source, "kind", "") == "tagged"
-            self.tag_sort_box.set_visible(bool(tagged))
-            if not tagged:
+            kind = getattr(source, "kind", "") if source is not None else ""
+            sortable = kind in ("tagged", "mytags")
+            self.tag_sort_box.set_visible(bool(sortable))
+            if not sortable:
                 return
             top = str(getattr(source, "sort", "latest")) == "top"
             self._tag_sort_syncing = True
             try:
                 self.tag_sort_top.set_active(top)
                 self.tag_sort_latest.set_active(not top)
+                for button, active in (
+                    (self.tag_sort_latest, not top),
+                    (self.tag_sort_top, top),
+                ):
+                    if active:
+                        button.add_css_class("tag-sort-active")
+                    else:
+                        button.remove_css_class("tag-sort-active")
             finally:
                 self._tag_sort_syncing = False
         except Exception:  # noqa: BLE001
@@ -787,7 +798,7 @@ class MainWindow(Adw.ApplicationWindow):
         if self._tag_sort_syncing:
             return
         source = self.current_source
-        if source is None or getattr(source, "kind", "") != "tagged":
+        if source is None or getattr(source, "kind", "") not in ("tagged", "mytags"):
             return
         sort = "top" if self.tag_sort_top.get_active() else "latest"
         if sort == str(getattr(source, "sort", "latest")):
@@ -796,7 +807,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _switch_tag_sort(self, sort: str) -> None:
         source = self.current_source
-        if source is None or getattr(source, "kind", "") != "tagged":
+        if source is None or getattr(source, "kind", "") not in ("tagged", "mytags"):
             return
         fraction = 0.0
         old_page = self.feed_page
@@ -807,12 +818,15 @@ class MainWindow(Adw.ApplicationWindow):
                 fraction = adjustment.get_value() / span
         except Exception:  # noqa: BLE001
             fraction = 0.0
-        new_source = FeedSource(
-            "tagged",
-            value=str(source.value or ""),
-            title=str(source.title or f"#{source.value}"),
-            sort=sort,
-        )
+        if getattr(source, "kind", "") == "mytags":
+            new_source = FollowedTagsSource(sort=sort)
+        else:
+            new_source = FeedSource(
+                "tagged",
+                value=str(source.value or ""),
+                title=str(source.title or f"#{source.value}"),
+                sort=sort,
+            )
         self.open_feed(new_source)
         if fraction > 0.02:
             def restore() -> bool:
@@ -848,6 +862,10 @@ class MainWindow(Adw.ApplicationWindow):
             base = f"@{source.value}.tumblr.com"
         elif kind == "tagged":
             base = f"#{source.value}"
+            if str(getattr(source, "sort", "latest")) == "top":
+                base += " · Top"
+        elif kind == "mytags":
+            base = "Your tags"
             if str(getattr(source, "sort", "latest")) == "top":
                 base += " · Top"
         elif kind == "search":

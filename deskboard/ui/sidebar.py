@@ -17,7 +17,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk
 
-from ..api.sources import FeedSource
+from ..api.sources import FeedSource, FollowedTagsSource
 
 
 class Sidebar(Gtk.Box):
@@ -162,6 +162,7 @@ class Sidebar(Gtk.Box):
                     FeedSource("dashboard", title="Following", icon="system-users-symbolic")
                 )
                 self._add_row(FeedSource("likes", title="Likes", icon="emote-love-symbolic"))
+                self._add_row(FollowedTagsSource(sort="latest"), marker="#")
 
             # Explore is public, so it is available signed out too.
             self._add_row(
@@ -255,6 +256,9 @@ class Sidebar(Gtk.Box):
             row.set_child(box)
             self.listbox.append(row)
             self._rows[key] = row
+            if getattr(source, "kind", "") == "mytags":
+                # The header Latest | Top toggle uses the same logical row.
+                self._rows[FollowedTagsSource(sort="top").key] = row
         except Exception:  # noqa: BLE001
             pass
 
