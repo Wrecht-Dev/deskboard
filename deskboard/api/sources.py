@@ -28,11 +28,13 @@ class FeedSource:
     title: str = ""
     subtitle: str = ""
     icon: str = "user-home-symbolic"
+    sort: str = "latest"  # tagged feeds: "latest" | "top"
 
     @property
     def key(self) -> str:
         """Stable identity used for sidebar selection and caching."""
-        return f"{self.kind}:{self.value}" if self.value else self.kind
+        suffix = f":{self.sort}" if self.kind == TAGGED and self.sort != "latest" else ""
+        return (f"{self.kind}:{self.value}" if self.value else self.kind) + suffix
 
     @property
     def label(self) -> str:
@@ -69,7 +71,7 @@ class FeedSource:
         if self.kind == BLOG:
             return client.get_blog_posts(self.value)
         if self.kind == TAGGED:
-            return client.get_tagged(self.value)
+            return client.get_tagged(self.value, sort=self.sort)
         if self.kind == SEARCH:
             return client.search(self.value)
         if self.kind == FOLLOWING:
@@ -80,7 +82,10 @@ class FeedSource:
         return self.kind in (HOME, DASHBOARD, LIKES, FOLLOWING, SEARCH)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind, "value": self.value}
+        data: dict[str, Any] = {"kind": self.kind, "value": self.value}
+        if self.kind == TAGGED:
+            data["sort"] = self.sort
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FeedSource":

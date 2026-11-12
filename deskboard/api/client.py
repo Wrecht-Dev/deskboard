@@ -409,9 +409,16 @@ class TumblrClient:
     def search(self, query: str, limit: int = config.PAGE_SIZE) -> Page:
         return self._to_page(self.request("/v2/timeline/search", {"query": query, "limit": limit}))
 
-    def get_tagged(self, tag: str, limit: int = config.PAGE_SIZE) -> Page:
-        """Tag pages still live on the older ``/v2/tagged`` route."""
-        return self._to_page(self.request("/v2/tagged", {"tag": tag, "limit": limit}))
+    def get_tagged(self, tag: str, limit: int = config.PAGE_SIZE, sort: str = "latest") -> Page:
+        """Tag pages (``/v2/tagged``).
+
+        ``sort`` is ``"latest"`` or ``"top"``; the web expresses it in the page
+        URL (``/tagged/{tag}?sort=top``).
+        """
+        params = {"tag": tag, "limit": limit}
+        if sort and sort != "latest":
+            params["sort"] = sort
+        return self._to_page(self.request("/v2/tagged", params))
 
     def _to_items(self, data: dict, keys: tuple[str, ...], before_key: str = "before") -> ItemPage:
         if isinstance(data, list):
